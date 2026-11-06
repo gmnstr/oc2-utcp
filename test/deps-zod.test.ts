@@ -8,10 +8,11 @@ import { fileURLToPath } from "node:url";
  * Dependency guard for GHSA-mrhx-c7xc-m3w5 (zod < 4.6.6).
  *
  * The MCP SDK must resolve the patched zod (4.6.6+) for server-response
- * parsing. @utcp/sdk is intentionally kept on zod 3.25.76 via the lockfile
- * override `"@utcp/sdk/zod"`, because the SDK is incompatible with zod 4
- * (measured 40/119 failures when forced). This test asserts both facts against
- * the real on-disk module locations and fails on any new, unreviewed zod copy.
+ * parsing. @utcp/sdk is intentionally kept on zod 3.25.76 through a nested
+ * resolution kept in bun.lock (`"@utcp/sdk/zod"`), because the SDK is
+ * incompatible with zod 4 (measured 40/119 failures when forced). This test
+ * asserts those facts against the real on-disk module locations, against the
+ * lockfile entries, and fails on any new, unreviewed zod copy.
  */
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -29,6 +30,32 @@ const EXPECTED_ZOD_COPIES: Readonly<Record<string, string>> = {
   "node_modules/zod": "4.6.7",
   "node_modules/@utcp/sdk/node_modules/zod": "3.25.76",
 };
+
+/**
+ * Reviewed zod package entries in bun.lock, keyed by lockfile package key
+ * (`"zod"` for the top level, `"<parent>/zod"` for a nested resolution) with
+ * the resolved version. The nested `@utcp/sdk/zod` entry is a deliberate
+ * resolution, not an override.
+ */
+const EXPECTED_LOCK_ZOD_ENTRIES: Readonly<Record<string, string>> = {
+  zod: "4.6.7",
+  "@utcp/sdk/zod": "3.25.76",
+};
+
+/**
+ * Every package entry in bun.lock whose last path segment is `zod`, with its
+ * resolved version. Entries sit at four-space indentation as `"<key>": ["zod@<version>", ...]`;
+ * workspace declarations (`"zod": "4.6.7"` at deeper indentation) are not entries.
+ */
+function lockfileZodEntries(): Record<string, string> {
+  const lock = readFileSync(join(ROOT, "bun.lock"), "utf8");
+  const found: Record<string, string> = {};
+  const entry = /^ {4}"((?:[^"\n]*\/)?zod)": \["zod@([^"]+)"/gm;
+  for (const match of lock.matchAll(entry)) {
+    found[match[1] ?? ""] = match[2] ?? "";
+  }
+  return found;
+}
 
 function readVersion(pkgJsonPath: string): string {
   const parsed = JSON.parse(readFileSync(pkgJsonPath, "utf8")) as { version?: unknown };
@@ -120,8 +147,12 @@ describe("zod dependency split (GHSA-mrhx-c7xc-m3w5)", () => {
     const [major] = parseSemver(version);
     expect(
       major,
-      `zod resolved from @utcp/sdk is ${version} at ${path}; expected major 3 (see lockfile override "@utcp/sdk/zod")`,
+      `zod resolved from @utcp/sdk is ${version} at ${path}; expected major 3 (see the nested resolution "@utcp/sdk/zod" in bun.lock)`,
     ).toBe(3);
+  });
+
+  test("bun.lock lists exactly the reviewed zod entries", () => {
+    expect(lockfileZodEntries()).toEqual(EXPECTED_LOCK_ZOD_ENTRIES);
   });
 
   test("the set of zod copies matches the reviewed map", () => {

@@ -442,7 +442,7 @@ describe("schema subset", () => {
     // `$ref` stays here as a malformed local pointer: only `#/$defs/<name>` and
     // `#/definitions/<name>` are supported (see the local-ref test above).
     // The other supported keywords (`$defs`, `definitions`, `oneOf`, `anyOf`,
-    // `patternProperties`, `uniqueItems`, `multipleOf`, `exclusiveMinimum`,
+    // `multipleOf`, `exclusiveMinimum`,
     // `exclusiveMaximum`) are no longer in this list.
     const cases: Array<{ keyword: string; value: unknown }> = [
       { keyword: "$ref", value: "#/properties/x" },

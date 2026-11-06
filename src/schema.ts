@@ -9,16 +9,20 @@
  *    readiness; `describe` and `call` read that frozen verdict instead of
  *    re-walking the schema, so an unsupported schema is reported precisely
  *    rather than surfacing as an Ajv internal error. The walk also bounds the
- *    schema before Ajv sees it: a node budget, a literal nesting limit, a
- *    `$ref` chain limit, and a static evaluation bound that rejects fan-out
- *    through shared definitions (see `evaluationBound`).
+ *    schema before Ajv sees it: a literal node budget, a literal nesting limit,
+ *    a `$ref` chain limit, refusal of recursive references, and a static
+ *    evaluation bound (see `evaluationBound`) that rejects fan-out through
+ *    shared definitions.
  * 2. Ajv compilation with coercion, defaults and removal all disabled, so the
  *    arguments that reach the transport are exactly the arguments supplied.
+ *    Before Ajv runs, the arguments are checked against the schema's bound
+ *    times their node count (`MAX_EVAL_WORK`).
  *
  * Local references are supported: `$ref` only to `#/$defs/<name>` or
- * `#/definitions/<name>` in the root schema. Every other reference form, and
- * every keyword outside the table below, is rejected by name. A schema outside
- * the subset stays discoverable and describable but is never executable.
+ * `#/definitions/<name>` in the root schema, and never recursively. Every other
+ * reference form, and every keyword outside the table below, is rejected by
+ * name. A schema outside the subset stays discoverable and describable but is
+ * never executable.
  */
 
 import Ajv, { type ErrorObject, type ValidateFunction } from "ajv";
@@ -26,14 +30,25 @@ import addFormats from "ajv-formats";
 import type { JsonSchema } from "@utcp/sdk";
 import { displayText, type SchemaIssue } from "./errors.js";
 
-/** Schema objects the walk may visit before the schema is refused as too large. */
+/**
+ * Schema objects the walk may visit before the schema is refused as too large.
+ * Counts literal schema nodes only: a definition reached by several `$ref`s is
+ * still counted once here.
+ */
 export const MAX_SCHEMA_NODES = 10_000;
 /**
- * Upper bound on validation paths a schema may generate. The bound multiplies
- * across `anyOf`/`oneOf` branches that re-enter a shared definition, so a
- * schema of n such levels costs about 2^n checks; it is refused above this.
+ * Upper bound on validation paths one instance may take through a schema. Recursive
+ * references are refused, so the count is exact: each `anyOf`/`oneOf` branch and
+ * each `$ref` re-checks the same instance, and n levels that each reference the
+ * previous one through two branches cost 2^n paths.
  */
 export const MAX_EVAL_PATHS = 16_384;
+/**
+ * Upper bound on the validator's work for one call: the schema's evaluation bound
+ * times the number of argument nodes. Arguments above it are refused before Ajv runs,
+ * because a schema that is cheap for one value can be expensive for a long array.
+ */
+export const MAX_EVAL_WORK = 10_000_000;
 /** Nested `$ref` targets along one resolution path. */
 export const MAX_REF_DEPTH = 64;
 /** Nesting depth of the arguments object, measured before validation. */
@@ -73,17 +88,19 @@ const SUPPORTED_KEYWORDS = new Set([
   // Combinators; each branch is walked as a schema.
   "anyOf",
   "oneOf",
-  // Numeric and array constraints (Tier B).
-  "uniqueItems",
+  // Numeric constraints (Tier B).
   "multipleOf",
   "exclusiveMinimum",
   "exclusiveMaximum",
-  "patternProperties",
 ]);
 
 /**
  * Keywords explicitly rejected, with the keyword itself as the reported name.
  * Anything in neither set is also rejected: the walk fails closed.
+ *
+ * `uniqueItems` is quadratic in the array length when the items are not scalars,
+ * and `patternProperties` matches model-chosen property names against schema
+ * regular expressions. Both are deferred.
  */
 const REJECTED_KEYWORDS = new Set([
   "allOf",
@@ -101,6 +118,8 @@ const REJECTED_KEYWORDS = new Set([
   "prefixItems",
   "unevaluatedProperties",
   "unevaluatedItems",
+  "uniqueItems",
+  "patternProperties",
 ]);
 
 const SUPPORTED_TYPES = new Set([
@@ -142,6 +161,8 @@ function isKnownFormat(name: string): boolean {
 export interface SchemaCheck {
   supported: boolean;
   issues: SchemaIssue[];
+  /** Static evaluation bound (validation paths per instance); set only when supported. */
+  bound?: number;
 }
 
 export type ArgumentValidation =
@@ -151,6 +172,8 @@ export type ArgumentValidation =
 export interface CompiledSchema {
   check: SchemaCheck;
   validate?: ValidateFunction;
+  /** Evaluation bound of the compiled schema; set only when `validate` is set. */
+  bound?: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -302,25 +325,6 @@ function walk(schema: unknown, path: string, depth: number, ctx: WalkContext): v
         }
         break;
       }
-      case "patternProperties": {
-        if (!isRecord(value)) {
-          pushIssue(ctx.issues, childPath, "patternProperties");
-          break;
-        }
-        for (const [pattern, subSchema] of Object.entries(value)) {
-          const subPath = schemaPath(childPath, pattern);
-          try {
-            // Ajv compiles `pattern` keywords with the unicode flag, so a key
-            // that only compiles without it would still fail later.
-            new RegExp(pattern, "u");
-          } catch {
-            pushIssue(ctx.issues, subPath, "patternProperties");
-            continue;
-          }
-          walk(subSchema, subPath, depth + 1, ctx);
-        }
-        break;
-      }
       case "items": {
         if (Array.isArray(value)) {
           // Tuple form is explicitly unsupported.
@@ -350,7 +354,9 @@ function walk(schema: unknown, path: string, depth: number, ctx: WalkContext): v
           break;
         }
         try {
-          new RegExp(value);
+          // Ajv compiles `pattern` with the unicode flag, so a pattern that only
+          // compiles without it (for example `\-`) would fail later, not here.
+          new RegExp(value, "u");
         } catch {
           pushIssue(ctx.issues, childPath, "pattern");
         }
@@ -380,10 +386,6 @@ function walk(schema: unknown, path: string, depth: number, ctx: WalkContext): v
         }
         break;
       }
-      case "uniqueItems": {
-        if (typeof value !== "boolean") pushIssue(ctx.issues, childPath, keyword);
-        break;
-      }
       case "title":
       case "description": {
         if (typeof value !== "string") pushIssue(ctx.issues, childPath, keyword);
@@ -406,124 +408,65 @@ function addBound(a: number, b: number): number {
   return Math.min(BOUND_CAP, a + b);
 }
 
-/**
- * Result of visiting a schema node or reference target.
- * - `bound`: validation paths for one instance, saturated at BOUND_CAP.
- * - `hits`: back-edges (targets already in progress) reachable from this node
- *   through same-instance edges only, saturated at HIT_CAP. Above 1 means one
- *   instance is re-checked by several recursive branches.
- */
-interface Visit {
-  readonly bound: number;
-  readonly hits: number;
-}
-
-/** Saturation point for `hits`: only "none", "one" and "more than one" matter. */
-const HIT_CAP = 2;
-
-/** Visits allowed per check. Hit-dependent results are not memoized, so this caps the work. */
-const MAX_BOUND_VISITS = 4 * MAX_SCHEMA_NODES;
-
-function addHits(a: number, b: number): number {
-  return Math.min(HIT_CAP, a + b);
-}
-
 interface BoundState {
   readonly root: Record<string, unknown>;
-  /** Finished result per reference target, keyed `<container>/<name>`. Only hit-free results are stored. */
-  readonly memo: Map<string, Visit>;
-  /** Targets on the current resolution path. Its size is the ref depth. */
+  /** Finished bound per reference target, keyed `<container>/<name>`. */
+  readonly memo: Map<string, number>;
+  /** Targets on the current resolution path. A repeat is a cycle; the size is the ref depth. */
   readonly inProgress: Set<string>;
-  /** Nodes visited so far in this check. */
-  visits: number;
-  /** Back-edges to in-progress targets seen so far, including through descents. */
-  backEdges: number;
 }
 
-const NO_CHAIN: ReadonlySet<string> = new Set();
-
-function visitNode(
-  node: Record<string, unknown>,
-  path: string,
-  chain: ReadonlySet<string>,
-  state: BoundState,
-): Visit {
-  state.visits += 1;
-  if (state.visits > MAX_BOUND_VISITS) halt("arguments", "$ref", "schema too large");
-
+/**
+ * Validation paths for one instance of `node`: 1, plus the bounds of every child
+ * schema (properties values, items, the additionalProperties schema, and the
+ * anyOf/oneOf branches). A `$ref` node takes the bound of its target.
+ *
+ * Recursion is refused (see boundOfRef), so the reference graph is acyclic and
+ * this memoized sum is an exact per-instance count of validation paths. Fan-out
+ * cannot hide inside recursion: a review found schemas where two branches each
+ * descend into the same recursive definition, which gives 2^depth paths for one
+ * instance. Those schemas now fail at the cycle, not at the count.
+ */
+function boundOfNode(node: Record<string, unknown>, path: string, state: BoundState): number {
   if (hasOwn(node, "$ref") && typeof node["$ref"] === "string") {
-    return visitRef(node["$ref"], schemaPath(path, "$ref"), chain, state);
+    return boundOfRef(node["$ref"], schemaPath(path, "$ref"), state);
   }
 
-  // A descent (properties, items, additionalProperties, patternProperties)
-  // makes the data smaller, so recursion through it ends with the data. A
-  // same-instance edge (anyOf, oneOf) does not: the same data is validated
-  // again by each branch. `chain` holds the targets entered since the last
-  // descent on this path, which is what separates the two kinds of cycle.
-  //
-  // A back-edge hit under a descent is one level of data-driven recursion and
-  // counts once. Several hits on one instance (two branches each recursing into
-  // the same child) are the exponential case, so a descent child with more than
-  // one hit is refused. Its hits are not passed upward, because the child's
-  // data is a different instance from this node's.
   let bound = 1;
-  let hits = 0;
-  const descend = (child: unknown, childPath: string): void => {
-    if (!isRecord(child)) return;
-    const result = visitNode(child, childPath, NO_CHAIN, state);
-    if (result.hits > 1) halt(childPath, "$ref", "recursion branches on the same instance");
-    bound = addBound(bound, result.bound);
-  };
-  const sameInstance = (child: unknown, childPath: string): void => {
-    if (!isRecord(child)) return;
-    const result = visitNode(child, childPath, chain, state);
-    bound = addBound(bound, result.bound);
-    hits = addHits(hits, result.hits);
+  const child = (value: unknown, childPath: string): void => {
+    if (isRecord(value)) bound = addBound(bound, boundOfNode(value, childPath, state));
   };
 
   if (isRecord(node["properties"])) {
     for (const [name, sub] of Object.entries(node["properties"])) {
-      descend(sub, schemaPath(schemaPath(path, "properties"), name));
+      child(sub, schemaPath(schemaPath(path, "properties"), name));
     }
   }
-  if (isRecord(node["items"])) descend(node["items"], schemaPath(path, "items"));
+  if (isRecord(node["items"])) child(node["items"], schemaPath(path, "items"));
   if (isRecord(node["additionalProperties"])) {
-    descend(node["additionalProperties"], schemaPath(path, "additionalProperties"));
-  }
-  if (isRecord(node["patternProperties"])) {
-    for (const [pattern, sub] of Object.entries(node["patternProperties"])) {
-      descend(sub, schemaPath(schemaPath(path, "patternProperties"), pattern));
-    }
+    child(node["additionalProperties"], schemaPath(path, "additionalProperties"));
   }
   for (const key of ["anyOf", "oneOf"] as const) {
     const branches = node[key];
     if (!Array.isArray(branches)) continue;
-    branches.forEach((branch, index) => sameInstance(branch, schemaPath(schemaPath(path, key), String(index))));
+    branches.forEach((branch, index) => child(branch, schemaPath(schemaPath(path, key), String(index))));
   }
-  return { bound, hits };
+  return bound;
 }
 
-function visitRef(value: string, path: string, chain: ReadonlySet<string>, state: BoundState): Visit {
+function boundOfRef(value: string, path: string, state: BoundState): number {
   const match = REF_PATTERN.exec(value);
   if (match === null) halt(path, "$ref", "reference is not a local definition");
   const container = match[1] ?? "";
   const name = match[2] ?? "";
   const key = `${container}/${name}`;
 
-  // Entered again with no descent in between: the same data is checked by the
-  // same schema forever. Ajv would not terminate, so the schema is refused.
-  if (chain.has(key)) halt(path, "$ref", "reference cycle without descent");
+  // The target is already being resolved on this path, so the schema refers back
+  // to itself. Recursion is refused whether or not a property sits in between.
+  if (state.inProgress.has(key)) halt(path, "$ref", "recursive reference is not supported");
 
   const finished = state.memo.get(key);
   if (finished !== undefined) return finished;
-
-  // On the path, with a descent since it was entered: data-driven recursion.
-  // Each level consumes one level of the data, so it counts once in bound, and
-  // the hit records that this instance reached an ancestor again.
-  if (state.inProgress.has(key)) {
-    state.backEdges += 1;
-    return { bound: 1, hits: 1 };
-  }
 
   if (state.inProgress.size >= MAX_REF_DEPTH) halt(path, "$ref", "reference chain too deep");
 
@@ -532,34 +475,26 @@ function visitRef(value: string, path: string, chain: ReadonlySet<string>, state
   if (!isRecord(target)) halt(path, "$ref", "reference is not a local definition");
 
   state.inProgress.add(key);
-  const backEdgesBefore = state.backEdges;
-  const nextChain = new Set(chain);
-  nextChain.add(key);
-  let result: Visit;
+  let bound: number;
   try {
-    result = visitNode(target, `arguments.${container}.${name}`, nextChain, state);
+    bound = boundOfNode(target, `arguments.${container}.${name}`, state);
   } finally {
     state.inProgress.delete(key);
   }
-  // A result that reached an in-progress ancestor anywhere in its subtree (even
-  // through a descent) depends on which ancestors are in progress, so it is
-  // recomputed where it is reached again rather than reused.
-  if (result.hits === 0 && state.backEdges === backEdgesBefore) state.memo.set(key, result);
-  return result;
+  // Acyclic, so the result depends only on the target: memoize it unconditionally.
+  state.memo.set(key, bound);
+  return bound;
 }
 
 /**
- * Static bound on the validation work a walked schema can cause. A `$ref`
- * target whose result has no back-edge hits is evaluated once and memoized.
- * A result with hits is recomputed where it is reached, within MAX_BOUND_VISITS,
- * and a descent child that reaches the same in-progress target through two or
- * more same-instance branches is refused. The result counts the paths Ajv could take through the schema for one
- * instance: descents add, and so do the branches of `anyOf`/`oneOf` and the
- * targets of `$ref`, because all of those re-check the same instance.
+ * Static bound on the validation paths one instance can take through the walked
+ * schema. Recursive references are refused, so the reference graph is acyclic,
+ * each target's bound is computed once and memoized, and the total work is
+ * bounded by the schema's node count. A bound above MAX_EVAL_PATHS is refused.
  */
 function evaluationBound(root: Record<string, unknown>): number {
-  const state: BoundState = { root, memo: new Map(), inProgress: new Set(), visits: 0, backEdges: 0 };
-  const { bound } = visitNode(root, "arguments", NO_CHAIN, state);
+  const state: BoundState = { root, memo: new Map(), inProgress: new Set() };
+  const bound = boundOfNode(root, "arguments", state);
   if (bound > MAX_EVAL_PATHS) {
     halt("arguments", "$ref", "evaluation bound exceeds limit");
   }
@@ -573,17 +508,22 @@ function evaluationBound(root: Record<string, unknown>): number {
  */
 export function checkSchema(schema: unknown): SchemaCheck {
   const ctx: WalkContext = { root: schema, issues: [], nodes: 0 };
+  let bound: number | undefined;
   try {
     walk(schema, "arguments", 0, ctx);
     if (ctx.issues.length === 0 && isRecord(schema)) {
-      evaluationBound(schema);
+      bound = evaluationBound(schema);
     }
   } catch (error) {
     const issue = toIssue(error);
     ctx.issues.length = 0;
     ctx.issues.push(issue);
+    bound = undefined;
   }
-  return { supported: ctx.issues.length === 0, issues: ctx.issues };
+  const supported = ctx.issues.length === 0;
+  return supported && bound !== undefined
+    ? { supported, issues: ctx.issues, bound }
+    : { supported, issues: ctx.issues };
 }
 
 function toIssue(error: unknown): SchemaIssue {
@@ -617,6 +557,9 @@ function getAjv(): Ajv {
  */
 const compiled = new WeakMap<object, CompiledSchema>();
 
+/** Evaluation bound of each validator compiled here, read by validateArguments. */
+const evaluationBounds = new WeakMap<ValidateFunction, number>();
+
 /**
  * Checks and compiles a tool input schema.
  *
@@ -636,7 +579,9 @@ export function compileSchema(schema: unknown): CompiledSchema {
 
   try {
     const validate = getAjv().compile(schema as JsonSchema);
-    const result: CompiledSchema = { check, validate };
+    const bound = check.bound ?? MAX_EVAL_PATHS;
+    evaluationBounds.set(validate, bound);
+    const result: CompiledSchema = { check, validate, bound };
     if (key !== null) compiled.set(key, result);
     return result;
   } catch (error) {
@@ -745,19 +690,25 @@ function describeAjvError(error: ErrorObject, data: unknown, base: string): Argu
   }
 }
 
+interface ArgumentMeasure {
+  /** Nested deeper than MAX_ARG_DEPTH, or more than MAX_ARG_NODES values. */
+  readonly tooDeep: boolean;
+  /** Values visited, the root and every leaf included. Complete only when not `tooDeep`. */
+  readonly nodes: number;
+}
+
 /**
- * True when the arguments nest deeper than MAX_ARG_DEPTH containers, or hold
- * more than MAX_ARG_NODES values. Iterative: an explicit stack, so no input
- * depth can overflow the call stack.
+ * Measures the arguments. Iterative: an explicit stack, so no input depth can
+ * overflow the call stack. Stops early once either limit is exceeded.
  */
-function argumentsTooDeep(value: unknown): boolean {
+function measureArguments(value: unknown): ArgumentMeasure {
   const stack: Array<{ value: unknown; level: number }> = [{ value, level: 0 }];
   let visited = 0;
   while (stack.length > 0) {
     const entry = stack.pop();
     if (entry === undefined) break;
     visited += 1;
-    if (visited > MAX_ARG_NODES) return true;
+    if (visited > MAX_ARG_NODES) return { tooDeep: true, nodes: visited };
 
     const { value: current, level } = entry;
     let children: unknown[] | null = null;
@@ -767,11 +718,11 @@ function argumentsTooDeep(value: unknown): boolean {
       children = Object.values(current);
     }
     if (children === null) continue;
-    if (level + 1 > MAX_ARG_DEPTH) return true;
+    if (level + 1 > MAX_ARG_DEPTH) return { tooDeep: true, nodes: visited };
     for (const child of children) stack.push({ value: child, level: level + 1 });
-    if (visited + stack.length > MAX_ARG_NODES) return true;
+    if (visited + stack.length > MAX_ARG_NODES) return { tooDeep: true, nodes: visited };
   }
-  return false;
+  return { tooDeep: false, nodes: visited };
 }
 
 const ARGUMENTS_TOO_DEEP: ArgumentValidation = {
@@ -782,13 +733,27 @@ const ARGUMENTS_TOO_DEEP: ArgumentValidation = {
   message: "arguments are nested too deeply.",
 };
 
+const ARGUMENTS_TOO_LARGE: ArgumentValidation = {
+  ok: false,
+  path: "arguments",
+  expected: "arguments small enough for this schema",
+  received: "too large",
+  message: "arguments are too large for this tool's schema.",
+};
+
 /**
  * Validates arguments against a compiled schema. The object is validated
  * whole: no property is dropped, defaulted or coerced. Arguments nested beyond
- * MAX_ARG_DEPTH, or a validator that throws on them, fail without dispatch.
+ * MAX_ARG_DEPTH, arguments whose work (schema bound times node count) exceeds
+ * MAX_EVAL_WORK, or a validator that throws on them, fail without dispatch. A
+ * validator this module did not compile is assumed to have the largest bound.
  */
 export function validateArguments(validate: ValidateFunction, args: unknown): ArgumentValidation {
-  if (argumentsTooDeep(args)) return ARGUMENTS_TOO_DEEP;
+  const measured = measureArguments(args);
+  if (measured.tooDeep) return ARGUMENTS_TOO_DEEP;
+
+  const bound = evaluationBounds.get(validate) ?? MAX_EVAL_PATHS;
+  if (bound * measured.nodes > MAX_EVAL_WORK) return ARGUMENTS_TOO_LARGE;
 
   let passed: boolean;
   try {
