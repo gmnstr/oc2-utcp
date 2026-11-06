@@ -45,13 +45,18 @@ interface Harness {
   events: LogEvent[];
 }
 
-async function start(options: Record<string, unknown>, disposeDeadlineMs = 500): Promise<Harness> {
+async function start(
+  options: Record<string, unknown>,
+  disposeDeadlineMs = 500,
+  extraHooks: { abandonHoldMs?: number } = {},
+): Promise<Harness> {
   const host = makeFakeHost(options);
   const events: LogEvent[] = [];
   const adapter = new UtcpAdapter(host.ctx, {
     log: (event) => events.push(event),
     policyBaseline: () => "rule",
     disposeDeadlineMs,
+    ...extraHooks,
   });
   await adapter.start();
   cleanup.push(() => adapter.dispose());
@@ -226,6 +231,54 @@ describe("abandoned-call cap (D2 6)", () => {
     const again = await host.runJson("call", { name: "demo.hang", arguments: {} });
     expect(again.error.code).toBe("TIMEOUT");
     expect(server.hits("hang")).toBe(MAX_ABANDONED_PER_MANUAL + 1);
+  }, 30_000);
+});
+
+describe("abandoned slot hold (D2 1)", () => {
+  test("a slot is released at the hold deadline while the remote call never settles, and a later settle does not release it again", async () => {
+    const server = fixture([{ name: "hang", hold: true }]);
+    const { host, adapter } = await start(
+      { manuals: [httpManual("demo", server, { waitMs: 1000 })] },
+      500,
+      { abandonHoldMs: 300 },
+    );
+
+    const fill = () => Array.from({ length: MAX_ABANDONED_PER_MANUAL }, () => host.runJson("call", { name: "demo.hang", arguments: {} }));
+    for (const result of await Promise.all(fill())) expect(result.error.code).toBe("TIMEOUT");
+    expect(internals(adapter).abandonedByManual.get("demo")).toBe(MAX_ABANDONED_PER_MANUAL);
+
+    // Inside the hold window the cap still applies: the ninth call is refused.
+    const refused = await host.runJson("call", { name: "demo.hang", arguments: {} });
+    expect(refused.error.code).toBe("TOOL_UNAVAILABLE");
+    expect(server.total()).toBe(MAX_ABANDONED_PER_MANUAL);
+
+    // Past the hold the slots are free, but the remote calls are still pending
+    // and stay tracked in inflight until they settle.
+    await Bun.sleep(350);
+    expect(internals(adapter).abandonedByManual.get("demo")).toBeUndefined();
+    expect(internals(adapter).inflight.size).toBe(MAX_ABANDONED_PER_MANUAL);
+
+    const again = await host.runJson("call", { name: "demo.hang", arguments: {} });
+    expect(again.error.code).toBe("TIMEOUT");
+    expect(server.hits("hang")).toBe(MAX_ABANDONED_PER_MANUAL + 1);
+    expect(internals(adapter).abandonedByManual.get("demo")).toBe(1);
+
+    // Settling the eight old calls must not release the new call's slot a second time.
+    for (let index = 0; index < MAX_ABANDONED_PER_MANUAL; index += 1) expect(server.releaseOne()).toBe(true);
+    await Bun.sleep(200);
+    expect(internals(adapter).inflight.size).toBe(1);
+    expect(internals(adapter).abandonedByManual.get("demo")).toBe(1);
+
+    // Settling the last call drains the count to exactly zero.
+    expect(server.releaseOne()).toBe(true);
+    await waitFor(() => internals(adapter).inflight.size === 0, 5_000);
+    expect(internals(adapter).abandonedByManual.get("demo")).toBeUndefined();
+
+    // A full batch is admitted again, so the count is exactly zero and not negative.
+    for (const result of await Promise.all(fill())) expect(result.error.code).toBe("TIMEOUT");
+    const ninth = await host.runJson("call", { name: "demo.hang", arguments: {} });
+    expect(ninth.error.code).toBe("TOOL_UNAVAILABLE");
+    expect(server.hits("hang")).toBe(2 * MAX_ABANDONED_PER_MANUAL + 1);
   }, 30_000);
 });
 

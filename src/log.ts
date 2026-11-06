@@ -50,6 +50,16 @@ export type LogEvent =
       notice: "timeoutIgnored";
       manual: string;
       template: "http" | "sse";
+    }
+  | {
+      /**
+       * Logged once at startup. `available: false` means the pattern worker probe
+       * failed or timed out; the adapter keeps running, and calls to tools whose
+       * schema uses `pattern` are refused.
+       */
+      event: "config";
+      notice: "patternGuard";
+      available: boolean;
     };
 
 export interface Logger {

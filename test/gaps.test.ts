@@ -419,6 +419,21 @@ describe("waitMs configuration (D2 4)", () => {
     expect(await host.listNames()).toEqual([]);
   });
 
+  test("waitMs on an unnamed http manual is CONFIG_INVALID even with a valid value, and the message says a name is required", async () => {
+    const { host, adapter } = await startWithTemplate({
+      call_template_type: "http",
+      url: "http://127.0.0.1:1/m",
+      waitMs: 1000,
+    });
+
+    expect(adapter.status().state).toBe("closed");
+    expect(adapter.status().error?.code).toBe("CONFIG_INVALID");
+    expect(adapter.status().error?.message).toContain("manuals[0]");
+    expect(adapter.status().error?.message).toContain("`waitMs`");
+    expect(adapter.status().error?.message).toContain("requires the manual to have a `name`");
+    expect(await host.listNames()).toEqual([]);
+  });
+
   test("waitMs at the bounds is accepted on http and sse, and is never forwarded to the SDK", async () => {
     const server = fixture();
     type Register = (templates: Array<Record<string, unknown>>) => Promise<unknown>;
@@ -450,6 +465,51 @@ describe("waitMs configuration (D2 4)", () => {
     } finally {
       proto.registerManuals = original;
     }
+  }, 20_000);
+});
+
+describe("argument snapshot (D2 8)", () => {
+  const echoInputs = {
+    type: "object",
+    properties: { message: { type: "string" } },
+    additionalProperties: false,
+  };
+
+  test("arguments changed during the permission await are not what the transport receives", async () => {
+    const server = startUtcpFixture({ tools: [{ name: "echo", inputs: echoInputs }] });
+    cleanup.push(() => server.stop());
+    const args: Record<string, unknown> = { message: "original" };
+    const host = makeFakeHost(
+      { manuals: [{ name: "demo", call_template_type: "http", http_method: "GET", url: `${server.url}/manual`, content_type: "application/json" }] },
+      // The caller mutates the object it passed in, after validation and before dispatch.
+      { onAssert: () => void (args.message = "changed-during-permission") },
+    );
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined, policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    const result = await host.runJson("call", { name: "demo.echo", arguments: args });
+    expect(result.ok).toBe(true);
+    expect(JSON.stringify(result.result)).toContain("original");
+    expect(JSON.stringify(result.result)).not.toContain("changed-during-permission");
+  }, 20_000);
+
+  test("arguments that cannot be copied are INVALID_ARGUMENTS, and nothing is asked or sent", async () => {
+    const server = startUtcpFixture({ tools: [{ name: "echo", inputs: echoInputs }] });
+    cleanup.push(() => server.stop());
+    const host = makeFakeHost({
+      manuals: [{ name: "demo", call_template_type: "http", http_method: "GET", url: `${server.url}/manual`, content_type: "application/json" }],
+    });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined, policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    const result = await host.runJson("call", { name: "demo.echo", arguments: { message: "x", extra: () => 1 } });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe("INVALID_ARGUMENTS");
+    expect(result.error.message).toBe("`arguments` could not be copied for validation, so the call was not sent.");
+    expect(host.asserts).toHaveLength(0);
+    expect(server.total()).toBe(0);
   }, 20_000);
 });
 

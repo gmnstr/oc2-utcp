@@ -159,8 +159,9 @@ export function loadConfig(rawOptions: unknown, locationDirectory: string | unde
 
 /**
  * Validates a manual's `waitMs`: only `http` and `sse` templates may carry it,
- * and the value must be an integer within WAIT_MS_MIN..WAIT_MS_MAX. The value
- * is not echoed; the message names the manual and the key.
+ * the manual must have a `name` (the cap and the expiry log are keyed by it), and
+ * the value must be an integer within WAIT_MS_MIN..WAIT_MS_MAX. The value is not
+ * echoed; the message names the manual and the key.
  */
 function checkWaitMs(candidate: Record<string, unknown>, index: number): string | null {
   const rawName = typeof candidate.name === "string" ? candidate.name.trim() : "";
@@ -168,6 +169,9 @@ function checkWaitMs(candidate: Record<string, unknown>, index: number): string 
   const type = normalizeCallTemplateType(candidate.call_template_type);
   if (type !== "http" && type !== "sse") {
     return `\`waitMs\` on ${label} is supported only on \`http\` and \`sse\` call templates. Remove \`waitMs\` or change the manual's call template type.`;
+  }
+  if (rawName.length === 0) {
+    return `\`waitMs\` on ${label} requires the manual to have a \`name\`. Add a \`name\` to the manual or remove \`waitMs\`.`;
   }
   const value = candidate.waitMs;
   if (typeof value !== "number" || !Number.isInteger(value) || value < WAIT_MS_MIN || value > WAIT_MS_MAX) {

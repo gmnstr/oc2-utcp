@@ -811,6 +811,11 @@ const ARGUMENTS_TOO_LARGE: ArgumentValidation = {
  * (schema bound times node count) exceeds MAX_EVAL_WORK, or a validator that throws
  * on them, fail without dispatch. The depth and value-count checks run before Ajv. A
  * validator this module did not compile is assumed to have the largest bound.
+ *
+ * It does NOT apply the pattern guard: a schema that uses `pattern` is run here on
+ * the calling thread, with no deadline. The adapter uses validateArgumentsGuarded,
+ * which sends pattern schemas to a worker. This function is kept for schemas
+ * without `pattern` and for tests of the synchronous checks.
  */
 export function validateArguments(validate: ValidateFunction, args: unknown): ArgumentValidation {
   const refused = refuseBeforeValidation(args, evaluationBounds.get(validate) ?? MAX_EVAL_PATHS);
@@ -1020,7 +1025,34 @@ export async function validateArgumentsGuarded(
         path: "arguments",
         expected: "pattern validation available",
         received: "no pattern validation",
-        message: "pattern validation is unavailable in this runtime.",
+        message: "pattern validation is unavailable in this runtime. Retrying will not help.",
       };
+  }
+}
+
+const PROBE_SCHEMA = {
+  type: "object",
+  properties: { s: { type: "string", pattern: "^a$" } },
+} as const;
+
+/**
+ * Startup check that the pattern worker path works in this runtime. It runs two
+ * tiny pattern validations through validateArgumentsGuarded, the same path real
+ * calls take: `{s: "a"}` must pass, and `{s: "b"}` must be refused as a pattern
+ * miss (the negative control, so a worker that accepts everything is caught).
+ * Reports true only when both hold. A timeout, stop or unavailable worker is not
+ * a pattern miss and gives false. Any exception gives false; each worker is
+ * terminated on every path, and this never throws.
+ */
+export async function probePatternWorker(deadlineMs = 2_000): Promise<boolean> {
+  try {
+    const compiled = compileSchema(PROBE_SCHEMA);
+    if (!compiled.usesPattern || compiled.validate === undefined) return false;
+    const accepted = await validateArgumentsGuarded(compiled, { s: "a" }, { deadlineMs });
+    if (accepted.ok !== true) return false;
+    const refused = await validateArgumentsGuarded(compiled, { s: "b" }, { deadlineMs });
+    return refused.ok === false && refused.path === "arguments.s";
+  } catch {
+    return false;
   }
 }

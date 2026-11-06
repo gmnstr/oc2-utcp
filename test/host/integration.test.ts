@@ -61,6 +61,8 @@ suite(gate.title, () => {
         expect(run.stderr).toContain(
           '[oc2-utcp] {"event":"lifecycle","phase":"ready","detail":"search,describe,call"}',
         );
+        // Pattern guard probe, logged before readiness: the worker path works in this host.
+        expect(run.stderr).toContain('[oc2-utcp] {"event":"config","notice":"patternGuard","available":true}');
 
         // 2. Model-facing Code Mode catalog built from the same definitions.
         const body = JSON.stringify(lastToolRequest(sandbox.requests));

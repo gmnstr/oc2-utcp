@@ -3,11 +3,11 @@
  * is terminated at a deadline, and fail closed. Direct tests of compileSchema and
  * validateArgumentsGuarded, plus one adapter-level check.
  *
- * The inputs here are benign on purpose. In the local Bun 1.3.14 runtime the
- * catastrophic input `^(a+)+$` with 45 a's finishes well inside a 500 ms
- * deadline, so it cannot exercise the kill path. Deadline and stop behaviour are
- * exercised instead with a 1 ms deadline (a worker cannot boot and answer in
- * 1 ms) and with a worker terminated before it can reply.
+ * The kill path is exercised with hostile input: one run of `^(a+)+$` on 30 a's
+ * costs roughly 0.7-1 s in CI, so several such fields exceed a 500 ms deadline
+ * on any machine. Deadline and stop behaviour are also covered with a 1 ms
+ * deadline (a worker cannot boot and answer in 1 ms) and with a worker terminated
+ * before it can reply.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -17,6 +17,7 @@ import {
   MAX_PATTERN_WORKERS,
   compileSchema,
   livePatternWorkerCount,
+  probePatternWorker,
   terminatePatternWorkers,
   validateArgumentsGuarded,
 } from "../src/schema.js";
@@ -214,6 +215,80 @@ describe("hostile patterns (kill path)", () => {
     expect(result.ok).toBe(false);
     expect((result as { message: string }).message).toBe(TIME_LIMIT_MESSAGE);
     expect(elapsed).toBeLessThan(3000);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(livePatternWorkerCount()).toBe(0);
+
+    // A worker that was not terminated would keep burning CPU while the host
+    // waits. terminate() lets the regex run that is in progress finish (about
+    // 0.35 s was observed), so skip a 1 s warm-up, then measure a further idle
+    // second: a thread that was never stopped would burn about 1000 ms here.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const cpuBefore = process.cpuUsage();
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const cpu = process.cpuUsage(cpuBefore);
+    const cpuMs = (cpu.user + cpu.system) / 1_000;
+    console.log(`hostile-patterns idle cpu: ${cpuMs.toFixed(1)} ms over 1000 ms`);
+    expect(cpuMs).toBeLessThan(250);
+  }, 20_000);
+});
+
+describe("hostile patterns through the adapter", () => {
+  test("a call with six hostile pattern fields is VALIDATION_FAILED at the deadline, never dispatched, and never reaches the permission hook", async () => {
+    const properties: Record<string, unknown> = {};
+    const args: Record<string, string> = {};
+    for (const key of ["a", "b", "c", "d", "e", "f"]) {
+      properties[key] = { type: "string", pattern: "^(a+)+$" };
+      args[key] = `${"a".repeat(30)}!`;
+    }
+    const server: UtcpFixtureServer = startUtcpFixture({
+      tools: [{ name: "hostile", inputs: { type: "object", properties } }],
+    });
+    cleanup.push(() => server.stop());
+    const host = makeFakeHost({
+      manuals: [
+        {
+          name: "demo",
+          call_template_type: "http",
+          http_method: "GET",
+          url: `${server.url}/manual`,
+          content_type: "application/json",
+        },
+      ],
+    });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => {}, policyBaseline: () => "rule", disposeDeadlineMs: 500 });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    const result = await host.runJson("call", { name: "demo.hostile", arguments: args });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe("VALIDATION_FAILED");
+    expect(result.error.message).toBe(TIME_LIMIT_MESSAGE);
+    expect(server.hits("hostile")).toBe(0);
+    // Validation runs before assertPermission, so the permission hook never sees the call.
+    expect(host.asserts).toHaveLength(0);
+  }, 20_000);
+});
+
+describe("startup probe of the pattern worker", () => {
+  test("the probe schema accepts 'a' and refuses 'b' as a pattern miss, through the guarded path", async () => {
+    const compiled = compileSchema({
+      type: "object",
+      properties: { s: { type: "string", pattern: "^a$" } },
+    });
+    expect(await validateArgumentsGuarded(compiled, { s: "a" })).toEqual({ ok: true });
+    expect(await validateArgumentsGuarded(compiled, { s: "b" })).toMatchObject({ ok: false, path: "arguments.s" });
+    expect(livePatternWorkerCount()).toBe(0);
+  });
+
+  test("probePatternWorker resolves true locally and leaves no worker alive", async () => {
+    expect(await probePatternWorker()).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(livePatternWorkerCount()).toBe(0);
+  }, 20_000);
+
+  test("a probe whose deadline is missed resolves false, and still leaves no worker alive", async () => {
+    // A worker cannot boot and answer within 1 ms, so the deadline path runs.
+    expect(await probePatternWorker(1)).toBe(false);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(livePatternWorkerCount()).toBe(0);
   }, 20_000);

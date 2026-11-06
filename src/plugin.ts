@@ -28,6 +28,7 @@ import {
 } from "./transport.js";
 import {
   compileSchema,
+  probePatternWorker,
   terminatePatternWorkers,
   validateArgumentsGuarded,
   type CompiledSchema,
@@ -80,6 +81,16 @@ const DEFAULT_DISPOSE_DEADLINE_MS = 10_000;
  * before dispatch, so a hung server cannot accumulate unbounded in-flight work.
  */
 export const MAX_ABANDONED_PER_MANUAL = 8;
+
+/**
+ * How long an abandoned call holds its slot against MAX_ABANDONED_PER_MANUAL,
+ * counted from the moment it was abandoned. A slot is released at the earlier
+ * of this and the call settling. The promise stays tracked in `inflight` until
+ * it settles, so dispose still accounts for it. A remote call that never
+ * settles therefore stops blocking its manual after this long, but its socket
+ * may remain open.
+ */
+export const ABANDON_HOLD_MS = 300_000;
 
 /**
  * Sessions remembered by the policy-baseline probe. The probe runs once per
@@ -164,6 +175,8 @@ export interface AdapterHooks {
   installMcpProtocol?: () => NoRetryInstallation;
   /** Bound on each dispose wait (in-flight calls, client close). Tests lower it. */
   disposeDeadlineMs?: number;
+  /** How long an abandoned call holds its cap slot (ABANDON_HOLD_MS). Tests lower it. */
+  abandonHoldMs?: number;
 }
 
 interface CallContext {
@@ -198,8 +211,10 @@ export class UtcpAdapter {
   private readonly policyChecked = new Set<string>();
   /** Per-manual `waitMs` bound, keyed by the registered manual name. Never sent to the SDK. */
   private readonly waitMsByManual = new Map<string, number>();
-  /** Expired-but-unsettled calls per manual; released when each promise settles. */
+  /** Expired-but-unsettled calls per manual; each slot is released at settle or at the hold deadline. */
   private readonly abandonedByManual = new Map<string, number>();
+  /** Hold timers of abandoned slots not yet released; cleared on settle and in dispose. */
+  private readonly abandonHoldTimers = new Set<ReturnType<typeof setTimeout>>();
   private mcpRetrySuppressed = false;
   private initError: ErrorBody | null = null;
 
@@ -237,6 +252,11 @@ export class UtcpAdapter {
       await this.failStartup(classifyThrown(error));
       return;
     }
+
+    // One pattern-worker probe per startup, before readiness. It is bounded by
+    // its own deadline and never throws; a false result is reported, not fatal.
+    const patternGuardAvailable = await probePatternWorker();
+    this.logger.emit({ event: "config", notice: "patternGuard", available: patternGuardAvailable });
 
     try {
       await this.registerTools();
@@ -545,6 +565,11 @@ export class UtcpAdapter {
     // call returns a validation failure and is never dispatched.
     terminatePatternWorkers();
 
+    // Hold timers are cleared here. Each abandoned call still releases its slot
+    // when its promise settles, and the `released` flag keeps that to one release.
+    for (const timer of this.abandonHoldTimers) clearTimeout(timer);
+    this.abandonHoldTimers.clear();
+
     // Calls already dispatched cannot be cancelled (the SDK takes no signal);
     // account for them rather than claiming they stopped. The wait is bounded
     // so a call that never answers cannot hang the unload; an abandoned call is
@@ -634,6 +659,10 @@ export class UtcpAdapter {
 
   private disposeDeadlineMs(): number {
     return this.hooks.disposeDeadlineMs ?? DEFAULT_DISPOSE_DEADLINE_MS;
+  }
+
+  private abandonHoldMs(): number {
+    return this.hooks.abandonHoldMs ?? ABANDON_HOLD_MS;
   }
 
   /** Diagnostics for tests and operators; never contains credentials. */
@@ -837,9 +866,26 @@ export class UtcpAdapter {
       });
     }
 
+    // Validation and dispatch use this one copy. The copy is taken before the
+    // first await, so a getter, proxy or caller mutation during the await cannot
+    // make the dispatched arguments differ from the validated ones.
+    let snapshot: Record<string, unknown>;
+    try {
+      snapshot = structuredClone(rawArgs) as Record<string, unknown>;
+    } catch {
+      return failure({
+        code: "INVALID_ARGUMENTS",
+        message: "`arguments` could not be copied for validation, so the call was not sent.",
+        tool: displayText(entry.tool.name, 120),
+        path: "arguments.arguments",
+        expected: "plain data object",
+        received: "uncopyable object",
+      });
+    }
+
     // Pattern schemas are validated in a worker with a deadline (see schema.ts);
     // this await is the only point where validation leaves the host thread.
-    const validation = await validateArgumentsGuarded(entry.compiled, rawArgs);
+    const validation = await validateArgumentsGuarded(entry.compiled, snapshot);
     if (validation.ok === false) {
       return failure({
         code: "VALIDATION_FAILED",
@@ -852,7 +898,7 @@ export class UtcpAdapter {
     }
 
     this.notePolicyBaseline(context);
-    return { ok: true, entry, args: rawArgs };
+    return { ok: true, entry, args: snapshot };
   }
 
   private async assertPermission(entry: CatalogEntry, context: CallContext): Promise<void> {
@@ -901,7 +947,7 @@ export class UtcpAdapter {
       return failure({
         code: "TOOL_UNAVAILABLE",
         message:
-          "This manual already has the maximum number of calls still running after their wait deadline, so this call was not sent. Retry once those calls have finished.",
+          "This manual already has the maximum number of calls still running after their wait deadline, so this call was not sent. Retry in a few minutes.",
         tool: name,
         retryable: false,
       });
@@ -1044,16 +1090,30 @@ export class UtcpAdapter {
 
   /**
    * Counts a call that the adapter returned to its caller before it settled
-   * (expired at waitMs, or abandoned by an abort) against its manual. The count
-   * is released when the abandoned promise settles, however it settles.
+   * (expired at waitMs, or abandoned by an abort) against its manual. The slot
+   * is released at the earlier of two events: the abandoned promise settling, or
+   * ABANDON_HOLD_MS after the call was abandoned. The `released` flag makes the
+   * release happen once, so the other event cannot decrement the count again.
    */
   private abandon(manual: string, pending: Promise<unknown>): void {
     this.abandonedByManual.set(manual, (this.abandonedByManual.get(manual) ?? 0) + 1);
+    let released = false;
+    let holdTimer: ReturnType<typeof setTimeout> | undefined;
     const release = () => {
+      if (released) return;
+      released = true;
+      if (holdTimer !== undefined) {
+        clearTimeout(holdTimer);
+        this.abandonHoldTimers.delete(holdTimer);
+      }
       const remaining = (this.abandonedByManual.get(manual) ?? 1) - 1;
       if (remaining > 0) this.abandonedByManual.set(manual, remaining);
       else this.abandonedByManual.delete(manual);
     };
+    holdTimer = setTimeout(release, this.abandonHoldMs());
+    // Unref'd so the hold never keeps the host process alive by itself.
+    holdTimer.unref();
+    this.abandonHoldTimers.add(holdTimer);
     pending.then(release, release);
   }
 
