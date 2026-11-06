@@ -2,7 +2,8 @@
  * Plugin configuration validation (spec §9 step 1).
  *
  * Validation fails closed: when the configuration is invalid the adapter
- * registers no tools at all and reports `CONFIG_INVALID` from every tool call.
+ * registers no tools at all. The reason is exposed through `status().error`
+ * and the lifecycle log, not from individual tool calls.
  * Nothing here touches the network or the filesystem.
  */
 

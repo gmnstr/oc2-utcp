@@ -28,10 +28,17 @@ import { McpCommunicationProtocol } from "@utcp/mcp";
  * -------------------
  * The override calls the base class' internal helpers, because the retry
  * lives inside a private method and there is no configuration flag for it.
- * Each helper is checked at runtime before the factory is installed; when a
- * future SDK build renames or removes one, this function reports
- * `"unsupported"`, the factory is not installed, and the caller records the
- * residual risk instead of failing startup.
+ * Each helper is checked at runtime before the factory is installed. When a
+ * future SDK build renames or removes one, `checkProtocolSurface()` reports
+ * `"unsupported"`, the factory is not installed, and the caller refuses every
+ * MCP manual at startup (fail closed; see `initialize()` in plugin.ts). A
+ * manual is never registered without the no-retry protocol.
+ *
+ * The surface check is a heuristic. Helper presence cannot show that the base
+ * `callTool` still goes through `_withSession`, so the check also looks for
+ * that name in the source of `callTool`. test/mcp-retry.test.ts is the real
+ * guard: it executes a mutating tool through the installed protocol and counts
+ * the executions on the server.
  */
 
 const REQUIRED_HELPERS = [
@@ -39,6 +46,7 @@ const REQUIRED_HELPERS = [
   "_sessionKey",
   "_getTimeoutMs",
   "_getOrCreateSession",
+  "_withSession",
   "_runWithTimeout",
   "_classifySessionError",
   "_cleanupSession",
@@ -46,6 +54,9 @@ const REQUIRED_HELPERS = [
 ] as const;
 
 export type NoRetryInstallation = "installed" | "unsupported";
+
+/** Result of inspecting the base protocol prototype before installation. */
+export type ProtocolSurface = "supported" | "unsupported";
 
 type HelperName = (typeof REQUIRED_HELPERS)[number];
 
@@ -68,9 +79,27 @@ interface McpInternals {
 
 type Operation = (client: never) => Promise<unknown>;
 
-function hasHelpers(proto: object): boolean {
+/**
+ * Decides whether the base prototype exposes the surface the override needs.
+ *
+ * Pure: it reads the prototype and never installs anything, so tests can pass
+ * fake prototypes. Missing helpers, or a `callTool` that does not route through
+ * `_withSession`, mean the retry could not be removed safely.
+ */
+export function checkProtocolSurface(proto: object): ProtocolSurface {
   const record = proto as Record<string, unknown>;
-  return REQUIRED_HELPERS.every((name: HelperName) => typeof record[name] === "function");
+  const helpersPresent = REQUIRED_HELPERS.every(
+    (name: HelperName) => typeof record[name] === "function",
+  );
+  if (!helpersPresent) return "unsupported";
+
+  // Heuristic: the base `callTool` must reach the session wrapper we override.
+  // If it stopped doing so, overriding `_withSession` would do nothing.
+  const callTool = record["callTool"];
+  if (typeof callTool !== "function") return "unsupported";
+  return Function.prototype.toString.call(callTool).includes("_withSession")
+    ? "supported"
+    : "unsupported";
 }
 
 let installation: NoRetryInstallation | null = null;
@@ -86,7 +115,7 @@ let hadPreviousFactory = false;
 export function installNoRetryMcpProtocol(): NoRetryInstallation {
   if (installation !== null) return installation;
 
-  if (!hasHelpers(McpCommunicationProtocol.prototype)) {
+  if (checkProtocolSurface(McpCommunicationProtocol.prototype) === "unsupported") {
     installation = "unsupported";
     return installation;
   }
@@ -99,6 +128,41 @@ export function installNoRetryMcpProtocol(): NoRetryInstallation {
   const Base = McpCommunicationProtocol as unknown as BaseProtocol;
 
   class NoRetryMcpCommunicationProtocol extends Base {
+    /**
+     * Same race as the base implementation, but the timeout error is named
+     * `TimeoutError`. The base rejects with a plain `Error`, which
+     * `classifyThrown` cannot recognise, so a timeout raised by this timer
+     * would be reported as INTERNAL_ERROR. In practice the SDK's own request
+     * timeout (`McpError` -32001, same duration, armed first) usually wins and
+     * is already classified; this keeps the fallback path correct as well. The
+     * message keeps the base wording, so `_classifySessionError` still sees
+     * "timed out" and evicts the session.
+     */
+    async _runWithTimeout(
+      sessionKey: string,
+      timeoutMs: number,
+      client: unknown,
+      operation: Operation,
+    ): Promise<unknown> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          operation(client as never),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => {
+              const error = new Error(
+                `MCP operation on '${sessionKey}' timed out after ${timeoutMs / 1e3}s.`,
+              );
+              error.name = "TimeoutError";
+              reject(error);
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    }
+
     private get internals(): McpInternals {
       return this as unknown as McpInternals;
     }

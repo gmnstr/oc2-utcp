@@ -122,8 +122,10 @@ describe("local-file refusal", () => {
     const dir = mkdtempSync(join(tmpdir(), "oc2-utcp-stdio-"));
     const manualPath = join(dir, "manual.json");
     writeFileSync(manualPath, JSON.stringify({ tools: [] }));
-    const epoch = new Date(0);
-    utimesSync(manualPath, epoch, epoch);
+    // Age the atime with mtime strictly later. macOS APFS and Linux relatime
+    // only advance atime when atime < mtime, so atime == mtime (the epoch
+    // fixture) would make the positive control below a no-op.
+    utimesSync(manualPath, new Date(0), new Date(1000));
     const before = statSync(manualPath).atimeMs;
 
     const { adapter, host } = await start({

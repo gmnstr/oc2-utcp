@@ -10,7 +10,7 @@ A useful report includes the version of the plugin and OpenCode host, the config
 
 | Component | Version |
 | --- | --- |
-| oc2-utcp | 0.1.0 |
+| oc2-utcp | 0.1.1 |
 | OpenCode host | 2.2.5 |
 | `@utcp/sdk` | 1.2.0 |
 | `@utcp/http` | 1.1.14 |
@@ -25,7 +25,7 @@ Only the versions above are tested together. Older or newer combinations may wor
 
 | Advisory | Severity | Applies? | Why |
 | --- | --- | --- | --- |
-| [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5) `zod < 4.6.6` | high | yes, for untrusted MCP servers | The MCP SDK validates server responses with its `zod/v4` schemas, and zod accumulates one issue object per failing array element with no cap. `@utcp/sdk` 1.2.0 requires `zod ^3.23.8`, and zod 3 has no patched release; installing zod 4 breaks the SDK (34 of 95 tests fail). Keep `mcp-http` enabled only for servers you trust until upstream relaxes that range. |
+| [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5) `zod < 4.6.6` | high | yes, for untrusted MCP servers; manual parsing not assessed | The MCP SDK validates server responses with its `zod/v4` schemas, and zod accumulates one issue object per failing array element with no cap. `@utcp/sdk` 1.2.0 requires `zod ^3.23.8`, and zod 3 has no patched release; installing zod 4 breaks the SDK (34 of 95 tests fail). `@utcp/sdk` also parses fetched manuals with zod 3, so `http` manuals are parsed by the affected line too; whether the advisory's pattern is reachable through that path was not assessed. Keep `mcp-http` enabled only for servers you trust, and point manuals and MCP servers only at endpoints you trust, until upstream relaxes that range. |
 | [GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4) `glob` | moderate | no | Reached only through the `@opencode/plugin` development dependency; absent from a production install. |
 | [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) `minimatch` | moderate | no | Same development-only path as `glob`. |
 
@@ -40,7 +40,7 @@ Be aware of the following, which are documented behaviour rather than defects:
 
 - Manifests are fetched and MCP servers may be contacted **during plugin initialization**, before any per-call approval.
 - `mcp-stdio` manuals can **create a child process** at registration time. The class is disabled by default; enable it only for servers you trust.
-- The UTCP SDK writes its own diagnostics to **stdout**, independently of this adapter, and those diagnostics may contain queries, tool names and URLs.
+- The UTCP SDK and protocol packages (for example `@utcp/http`) write their own diagnostics to **stdout and stderr**, independently of this adapter, and those diagnostics may contain queries, tool names and URLs. SDK lines interleave with the adapter's `[oc2-utcp]` lines on stderr.
 - Tool calls are authorized by the host's `utcp` permission action. Configuring a tool does not by itself guarantee a human approval step; set an `ask` policy as described in the README.
 
 Out of scope: vulnerabilities in OpenCode itself, in the UTCP SDK packages, or in remote services the operator chooses to connect to. Report those upstream.

@@ -888,10 +888,12 @@ describe("policy baseline", () => {
 
     writeFileSync(
       join(withRule, "opencode.json"),
-      JSON.stringify({ permission: [{ action: "utcp", resource: "*", effect: "allow" }] }),
+      // The host reads the plural `permissions` array; a rule under the
+      // singular `permission` key is dropped, so it must not count here.
+      JSON.stringify({ permissions: [{ action: "utcp", resource: "*", effect: "allow" }] }),
       "utf8",
     );
-    writeFileSync(join(withoutRule, "opencode.json"), JSON.stringify({ permission: [] }), "utf8");
+    writeFileSync(join(withoutRule, "opencode.json"), JSON.stringify({ permissions: [] }), "utf8");
 
     expect(defaultPolicyBaseline(withRule)).toBe("rule");
     expect(defaultPolicyBaseline(withoutRule)).toBe("no-rule");

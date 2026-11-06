@@ -1,14 +1,44 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import { CommunicationProtocol, UtcpClient } from "@utcp/sdk";
-import "@utcp/mcp";
+import { McpCommunicationProtocol } from "@utcp/mcp";
 
 import { startFlakyMcpServer, type FlakyMcpServer } from "./fixtures/mcp-flaky-server.js";
 import {
+  checkProtocolSurface,
   installNoRetryMcpProtocol,
   resetNoRetryInstallationForTest,
   uninstallNoRetryMcpProtocol,
 } from "../src/mcp-no-retry.js";
+
+/** Every helper the no-retry override reads from the base prototype. */
+const REQUIRED_HELPERS = [
+  "_dereferenceSchema",
+  "_sessionKey",
+  "_getTimeoutMs",
+  "_getOrCreateSession",
+  "_withSession",
+  "_runWithTimeout",
+  "_classifySessionError",
+  "_cleanupSession",
+  "_invalidateOAuthToken",
+];
+
+function fakePrototype(
+  options: { omit?: string; callTool?: (...args: never[]) => unknown } = {},
+): Record<string, unknown> {
+  const proto: Record<string, unknown> = {};
+  for (const name of REQUIRED_HELPERS) {
+    if (name !== options.omit) proto[name] = () => undefined;
+  }
+  // Default: a callTool that routes through `_withSession`, like the base.
+  proto["callTool"] =
+    options.callTool ??
+    (async function callTool(this: { _withSession(): unknown }) {
+      return this._withSession();
+    });
+  return proto;
+}
 
 /**
  * Behavioural proof for spec §8 ("never automatically retry a potentially
@@ -106,6 +136,10 @@ describe("MCP mutating-call replay", () => {
     expect(server.executions()).toBe(2);
   });
 
+  test("the installed protocol reports a supported surface", () => {
+    expect(checkProtocolSurface(McpCommunicationProtocol.prototype)).toBe("supported");
+  });
+
   test("uninstalling restores the factory that was present before install", () => {
     const before = CommunicationProtocol.communicationProtocolFactories["mcp"];
     expect(typeof before).toBe("function");
@@ -116,5 +150,30 @@ describe("MCP mutating-call replay", () => {
 
     uninstallNoRetryMcpProtocol();
     expect(CommunicationProtocol.communicationProtocolFactories["mcp"]).toBe(before);
+  });
+});
+
+describe("protocol surface check", () => {
+  test("a complete surface whose callTool routes through _withSession is supported", () => {
+    expect(checkProtocolSurface(fakePrototype())).toBe("supported");
+  });
+
+  test("a prototype missing _withSession is unsupported", () => {
+    expect(checkProtocolSurface(fakePrototype({ omit: "_withSession" }))).toBe("unsupported");
+  });
+
+  test("a callTool that does not mention _withSession is unsupported", () => {
+    const proto = fakePrototype({
+      callTool: async function callTool(this: { _send(): unknown }) {
+        return this._send();
+      },
+    });
+    expect(checkProtocolSurface(proto)).toBe("unsupported");
+  });
+
+  test("a prototype without callTool is unsupported", () => {
+    const proto = fakePrototype();
+    delete proto["callTool"];
+    expect(checkProtocolSurface(proto)).toBe("unsupported");
   });
 });

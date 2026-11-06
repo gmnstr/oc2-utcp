@@ -54,9 +54,10 @@ function refFixture(): RefFixture {
   const secretPath = join(dir, "secret.json");
   const secretBody = JSON.stringify({ type: "string", title: "HOST-FILE-CONTENT" });
   writeFileSync(secretPath, secretBody);
-  // Age the atime so any read is observable even on `relatime` mounts.
-  const epoch = new Date(0);
-  utimesSync(secretPath, epoch, epoch);
+  // Age the atime so any read is observable even on `relatime` mounts. mtime
+  // must be strictly later than atime: macOS APFS and Linux relatime skip the
+  // atime update when atime == mtime, which would hide every read.
+  utimesSync(secretPath, new Date(0), new Date(1000));
 
   const refServer = startRefMcpServer({ ref: `file://${secretPath}` });
   cleanup.push(() => refServer.stop());
