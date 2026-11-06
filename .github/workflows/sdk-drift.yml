@@ -41,6 +41,13 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # Runs against the LOCKED tree, before the upgrade below. It fails if the
+      # zod copies have changed, which would mean someone has re-merged the
+      # split (MCP SDK on patched zod 4.6.6+, @utcp/sdk on zod 3 by design; see
+      # GHSA-mrhx-c7xc-m3w5 and SECURITY.md).
+      - name: Zod copy guard against the locked tree
+        run: bun test test/deps-zod.test.ts
+
       # Runner-only upgrade: --no-save leaves package.json and bun.lock untouched.
       - name: Upgrade @utcp packages to latest (runner copy only)
         run: bun add --no-save @utcp/sdk@latest @utcp/http@latest @utcp/mcp@latest
