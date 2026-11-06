@@ -176,14 +176,15 @@ export function installNoRetryMcpProtocol(): NoRetryInstallation {
      * the host issue the request. Both happen while a manual is being
      * registered -- before any permission check, before the adapter inspects
      * the schema and before any call is authorized -- and a malicious MCP
-     * server chooses the schema. The adapter's own schema subset rejects
-     * `$ref` and `$defs` outright, so dereferencing buys nothing here; it only
-     * adds I/O the remote side controls.
+     * server chooses the schema.
      *
-     * Returning the schema unchanged keeps the tool discoverable with
-     * `schemaSupported: false` and renders it non-executable
-     * (`SCHEMA_UNSUPPORTED`), which is the documented behaviour for an
-     * unsupported keyword.
+     * The adapter validates local references itself (`#/$defs/<name>` and
+     * `#/definitions/<name>` in the root schema), so it does not need the SDK
+     * to inline them. Any other reference is rejected by the adapter's schema
+     * walk without being resolved. Returning the schema unchanged therefore
+     * costs nothing: the tool stays discoverable with `schemaSupported: false`
+     * (keyword `$ref`) for an external reference, or is validated locally for
+     * a local one, and no I/O happens at registration either way.
      */
     async _dereferenceSchema(schema: unknown): Promise<unknown> {
       return schema;

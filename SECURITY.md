@@ -10,7 +10,7 @@ A useful report includes the version of the plugin and OpenCode host, the config
 
 | Component | Version |
 | --- | --- |
-| oc2-utcp | 0.1.1 |
+| oc2-utcp | 0.2.0 |
 | OpenCode host | 2.2.5 |
 | `@utcp/sdk` | 1.2.0 |
 | `@utcp/http` | 1.1.14 |
@@ -21,11 +21,11 @@ Only the versions above are tested together. Older or newer combinations may wor
 
 ## Known dependency advisories
 
-`bun audit` reports three advisories against the reviewed dependency tree. Two do not apply to what is published here, and one cannot be fixed without breaking a dependency contract:
+`bun audit` reports three advisories against the reviewed dependency tree. Two do not apply to what is published here, and one is fixed only for the MCP response path (the other zod path cannot be fixed without breaking a dependency contract):
 
 | Advisory | Severity | Applies? | Why |
 | --- | --- | --- | --- |
-| [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5) `zod < 4.6.6` | high | yes, for untrusted MCP servers; manual parsing not assessed | The MCP SDK validates server responses with its `zod/v4` schemas, and zod accumulates one issue object per failing array element with no cap. `@utcp/sdk` 1.2.0 requires `zod ^3.23.8`, and zod 3 has no patched release; installing zod 4 breaks the SDK (measured 2026-11-06: 40 of 119 tests fail when the SDK is forced onto zod 4 by `bun add zod@4` plus removal of the SDK's nested zod 3 copy, in a throwaway checkout; with only a top-level zod 4 and the SDK's nested zod 3 kept, 0 tests fail). `@utcp/sdk` also parses fetched manuals with zod 3, so `http` manuals are parsed by the affected line too; whether the advisory's pattern is reachable through that path was not assessed. Keep `mcp-http` enabled only for servers you trust, and point manuals and MCP servers only at endpoints you trust, until upstream relaxes that range. |
+| [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5) `zod < 4.6.6` | high | partly: fixed in this release for MCP server-response parsing; still affected for `@utcp/sdk` manual parsing and anything `@utcp/http` bundles (not assessed) | Fixed in this release for MCP server-response parsing: the MCP SDK now resolves zod 4.6.7 (a direct dependency, pinned), while the lockfile keeps `@utcp/sdk` on zod 3.25.76 because the SDK is incompatible with zod 4 (measured 2026-11-06: 40 of 119 tests fail when forced). Enforced by `test/deps-zod.test.ts`. **Still affected:** `@utcp/sdk` manual parsing (zod 3.25.76; no patched zod 3 exists) and anything `@utcp/http` bundles; not assessed. Keep `http` manuals pointed only at trusted endpoints. The MCP response path is patched, so the earlier advice to keep `mcp-http` only for trusted servers is relaxed to this note. |
 | [GHSA-3g3m-2fjr-6pw4](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4) `glob` | moderate | no | Reached only through the `@opencode/plugin` development dependency; absent from a production install. |
 | [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249) `minimatch` | moderate | no | Same development-only path as `glob`. |
 

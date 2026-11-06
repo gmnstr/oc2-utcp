@@ -12,8 +12,11 @@ import { startRefMcpServer, type RefMcpServer } from "./fixtures/mcp-ref-server.
 import { resetNoRetryInstallationForTest, uninstallNoRetryMcpProtocol } from "../src/mcp-no-retry.js";
 
 /**
- * Spec §5 rejects `$ref` and `$defs` outright, and §9 requires the schema
- * verdict to be computed by the adapter from the schema the SDK hands it.
+ * Spec §9 requires the schema verdict to be computed by the adapter from the
+ * schema the SDK hands it. The adapter's subset accepts only local references
+ * (`#/$defs/<name>`, `#/definitions/<name>`), which it validates itself; every
+ * external `$ref` is rejected by the schema walk, and the walk never resolves
+ * one, so no I/O happens for it.
  *
  * `@utcp/mcp@1.2.0` dereferences every MCP tool schema while registering the
  * manual. `$RefParser.dereference()` resolves external targets by default, so a
@@ -24,7 +27,7 @@ import { resetNoRetryInstallationForTest, uninstallNoRetryMcpProtocol } from "..
  * These tests discriminate the two behaviours with a real MCP server:
  *  - stock protocol: the file is read and its contents land in the tool schema;
  *  - adapter (identity `_dereferenceSchema`): the file is never read, the tool
- *    stays discoverable and is rejected as `SCHEMA_UNSUPPORTED`.
+ *    stays discoverable and is rejected as `SCHEMA_UNSUPPORTED` (keyword `$ref`).
  */
 
 interface RefFixture {

@@ -315,7 +315,7 @@ describe("schema subset", () => {
           inputs: {
             type: "object",
             properties: {
-              filter: { oneOf: [{ type: "string" }, { type: "number" }] },
+              filter: { allOf: [{ type: "string" }, { minLength: 1 }] },
             },
           },
         },
@@ -327,8 +327,8 @@ describe("schema subset", () => {
     expect(described.ok).toBe(true);
     expect(described.tool.schemaSupported).toBe(false);
     expect(described.tool.schemaIssues[0]).toEqual({
-      path: "arguments.properties.filter.oneOf",
-      keyword: "oneOf",
+      path: "arguments.properties.filter.allOf",
+      keyword: "allOf",
     });
 
     const searched = await host.runJson("search", { query: "filtered" });
@@ -337,25 +337,60 @@ describe("schema subset", () => {
     const called = await host.runJson("call", { name: "demo.filtered", arguments: {} });
     expect(called.ok).toBe(false);
     expect(called.error.code).toBe("SCHEMA_UNSUPPORTED");
-    expect(called.error.keyword).toBe("oneOf");
+    expect(called.error.keyword).toBe("allOf");
     expect(host.asserts).toHaveLength(0);
     expect(server.total()).toBe(0);
   }, 20_000);
 
-  test("$ref is rejected rather than followed", async () => {
+  test("a local #/$defs $ref is validated, and external $ref forms are rejected unfollowed", async () => {
     const server = fixture({
       tools: [
         {
           name: "ref",
-          inputs: { type: "object", properties: { a: { $ref: "#/$defs/x" } }, $defs: { x: { type: "string" } } },
+          inputs: {
+            type: "object",
+            properties: { a: { $ref: "#/$defs/x" } },
+            required: ["a"],
+            $defs: { x: { type: "string" } },
+          },
         },
+        { name: "file_ref", inputs: { type: "object", properties: { a: { $ref: "file:///etc/passwd" } } } },
+        { name: "http_ref", inputs: { type: "object", properties: { a: { $ref: "https://example.invalid/s.json" } } } },
       ],
     });
     const { host } = await start({ manuals: [httpManual("demo", server)] });
 
     const described = await host.runJson("describe", { name: "demo.ref" });
-    expect(described.tool.schemaSupported).toBe(false);
-    expect(described.tool.schemaIssues.map((i: { keyword: string }) => i.keyword)).toContain("$ref");
+    expect(described.tool.schemaSupported).toBe(true);
+    expect(described.tool.schemaIssues).toBeUndefined();
+
+    const accepted = await host.runJson("call", { name: "demo.ref", arguments: { a: "ok" } });
+    expect(accepted.ok).toBe(true);
+    expect(server.hits("ref")).toBe(1);
+
+    const rejected = await host.runJson("call", { name: "demo.ref", arguments: { a: 5 } });
+    expect(rejected.ok).toBe(false);
+    expect(rejected.error.code).toBe("VALIDATION_FAILED");
+    expect(rejected.error.path).toBe("arguments.a");
+    expect(server.hits("ref")).toBe(1);
+
+    // The one successful call above went through the permission check; the
+    // external-ref refusals below must not add any further permission asserts.
+    const assertsBefore = host.asserts.length;
+    for (const name of ["demo.file_ref", "demo.http_ref"]) {
+      const external = await host.runJson("describe", { name });
+      expect(external.tool.schemaSupported).toBe(false);
+      expect(external.tool.schemaIssues.map((i: { keyword: string }) => i.keyword)).toContain("$ref");
+
+      const refused = await host.runJson("call", { name, arguments: { a: "x" } });
+      expect(refused.ok).toBe(false);
+      expect(refused.error.code).toBe("SCHEMA_UNSUPPORTED");
+      expect(refused.error.keyword).toBe("$ref");
+    }
+
+    expect(host.asserts).toHaveLength(assertsBefore);
+    expect(server.hits("file_ref")).toBe(0);
+    expect(server.hits("http_ref")).toBe(0);
   }, 20_000);
 
   test("a $schema other than draft-07 is rejected, and draft-07 is accepted", async () => {
@@ -404,18 +439,18 @@ describe("schema subset", () => {
   test("every rejected keyword is unsupported at describe and refuses the call", async () => {
     // One tool per rejected keyword, each keyword nested under a property so the
     // walk reaches it exactly the way a real manual would present it.
+    // `$ref` stays here as a malformed local pointer: only `#/$defs/<name>` and
+    // `#/definitions/<name>` are supported (see the local-ref test above).
+    // The other supported keywords (`$defs`, `definitions`, `oneOf`, `anyOf`,
+    // `patternProperties`, `uniqueItems`, `multipleOf`, `exclusiveMinimum`,
+    // `exclusiveMaximum`) are no longer in this list.
     const cases: Array<{ keyword: string; value: unknown }> = [
       { keyword: "$ref", value: "#/properties/x" },
-      { keyword: "$defs", value: { x: { type: "string" } } },
-      { keyword: "definitions", value: { x: { type: "string" } } },
-      { keyword: "oneOf", value: [{ type: "string" }, { type: "number" }] },
-      { keyword: "anyOf", value: [{ type: "string" }] },
       { keyword: "allOf", value: [{ type: "string" }] },
       { keyword: "not", value: { type: "string" } },
       { keyword: "if", value: { type: "string" } },
       { keyword: "then", value: { type: "string" } },
       { keyword: "else", value: { type: "string" } },
-      { keyword: "patternProperties", value: { "^a": { type: "string" } } },
       { keyword: "propertyNames", value: { pattern: "^a" } },
       { keyword: "dependencies", value: { x: ["y"] } },
       { keyword: "dependentRequired", value: { x: ["y"] } },
@@ -424,10 +459,6 @@ describe("schema subset", () => {
       { keyword: "minContains", value: 1 },
       { keyword: "maxContains", value: 2 },
       { keyword: "prefixItems", value: [{ type: "string" }] },
-      { keyword: "uniqueItems", value: true },
-      { keyword: "multipleOf", value: 2 },
-      { keyword: "exclusiveMinimum", value: 0 },
-      { keyword: "exclusiveMaximum", value: 10 },
       { keyword: "unevaluatedProperties", value: false },
       { keyword: "unevaluatedItems", value: false },
     ];
