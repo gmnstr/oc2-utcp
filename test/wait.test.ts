@@ -8,7 +8,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { MAX_ABANDONED_PER_MANUAL, UtcpAdapter } from "../src/plugin.js";
+import { MAX_ABANDONED_PER_MANUAL, MAX_OUTSTANDING_PER_MANUAL, UtcpAdapter } from "../src/plugin.js";
 import type { LogEvent } from "../src/log.js";
 import { makeFakeHost, type FakeHost } from "./helpers/host.js";
 import { startUtcpFixture, type FixtureTool, type UtcpFixtureServer } from "./fixtures/utcp-http-server.js";
@@ -66,9 +66,16 @@ async function start(
 /** The adapter's own bookkeeping, read for assertions only. */
 function internals(adapter: UtcpAdapter): {
   inflight: Set<Promise<unknown>>;
+  outstandingByManual: Map<string, number>;
   abandonedByManual: Map<string, number>;
+  abandonHoldTimers: Set<unknown>;
 } {
-  return adapter as unknown as { inflight: Set<Promise<unknown>>; abandonedByManual: Map<string, number> };
+  return adapter as unknown as {
+    inflight: Set<Promise<unknown>>;
+    outstandingByManual: Map<string, number>;
+    abandonedByManual: Map<string, number>;
+    abandonHoldTimers: Set<unknown>;
+  };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
@@ -219,7 +226,7 @@ describe("abandoned-call cap (D2 6)", () => {
     const refused = await host.runJson("call", { name: "demo.hang", arguments: {} });
     expect(refused.ok).toBe(false);
     expect(refused.error.code).toBe("TOOL_UNAVAILABLE");
-    expect(refused.error.retryable).toBe(false);
+    expect(refused.error.retryable).toBe(true);
     expect(refused.error.outcome).toBeUndefined();
     expect(server.total()).toBe(MAX_ABANDONED_PER_MANUAL);
 
@@ -305,7 +312,7 @@ describe("abort-abandoned calls count toward the cap (D2 6b)", () => {
     const refused = await host.runJson("call", { name: "demo.hang", arguments: {} });
     expect(refused.ok).toBe(false);
     expect(refused.error.code).toBe("TOOL_UNAVAILABLE");
-    expect(refused.error.retryable).toBe(false);
+    expect(refused.error.retryable).toBe(true);
     expect(server.total()).toBe(MAX_ABANDONED_PER_MANUAL);
 
     // Releasing the held requests settles them, and the count drains to zero.
@@ -386,5 +393,77 @@ describe("expiry log line (D2 8)", () => {
     expect(rendered).not.toContain("SECRET-HEADER");
     expect(rendered).not.toContain("SECRET-ARGUMENT");
     expect(rendered).not.toContain(server.url);
+  }, 20_000);
+});
+
+describe("outstanding bound per manual (D2 1, hard)", () => {
+  test("40 concurrent calls: 32 reach the fixture, 8 are refused at once, and the abandoned cap applies after the 32 expire", async () => {
+    const server = fixture([{ name: "hang", hold: true }]);
+    const { host, adapter } = await start({ manuals: [httpManual("demo", server, { waitMs: 1000 })] });
+
+    const startedAt = Date.now();
+    const outcomes = await Promise.all(
+      Array.from({ length: MAX_OUTSTANDING_PER_MANUAL + 8 }, () =>
+        host.runJson("call", { name: "demo.hang", arguments: {} }).then((result) => ({
+          result,
+          at: Date.now() - startedAt,
+        })),
+      ),
+    );
+
+    // The first 32 dispatch and expire at the deadline; the other 8 are refused
+    // during dispatch, long before any deadline.
+    const refused = outcomes.filter((outcome) => outcome.result.error?.code === "TOOL_UNAVAILABLE");
+    const expired = outcomes.filter((outcome) => outcome.result.error?.code === "TIMEOUT");
+    expect(refused).toHaveLength(8);
+    expect(expired).toHaveLength(MAX_OUTSTANDING_PER_MANUAL);
+    for (const { result, at } of refused) {
+      expect(result.error.retryable).toBe(true);
+      expect(result.error.outcome).toBeUndefined();
+      expect(at).toBeLessThan(900);
+    }
+    expect(server.hits("hang")).toBe(MAX_OUTSTANDING_PER_MANUAL);
+
+    const counts = internals(adapter);
+    expect(counts.outstandingByManual.get("demo")).toBe(MAX_OUTSTANDING_PER_MANUAL);
+    expect(counts.abandonedByManual.get("demo")).toBe(MAX_OUTSTANDING_PER_MANUAL);
+
+    // The 32 are now abandoned, so the abandoned cap (8) refuses the next call.
+    const after = await host.runJson("call", { name: "demo.hang", arguments: {} });
+    expect(after.error.code).toBe("TOOL_UNAVAILABLE");
+    expect(after.error.retryable).toBe(true);
+    expect(server.hits("hang")).toBe(MAX_OUTSTANDING_PER_MANUAL);
+
+    // Settling every held request releases both counts exactly to zero: they are
+    // deleted at zero, never left negative, so a full batch is admitted again.
+    while (server.releaseOne()) {
+      // Each release settles one held request.
+    }
+    await waitFor(
+      () => counts.outstandingByManual.get("demo") === undefined && counts.abandonedByManual.get("demo") === undefined,
+      5_000,
+    );
+    expect(counts.inflight.size).toBe(0);
+    const again = await host.runJson("call", { name: "demo.hang", arguments: {} });
+    expect(again.error.code).toBe("TIMEOUT");
+    expect(server.hits("hang")).toBe(MAX_OUTSTANDING_PER_MANUAL + 1);
+  }, 30_000);
+});
+
+describe("dispose creates no abandon-hold timer (D2 2)", () => {
+  test("a call that expires while dispose is still waiting for it leaves no hold timer behind", async () => {
+    const server = fixture([{ name: "hang", hold: true }]);
+    // dispose waits up to 1.5 s for the held call; the call expires at 1 s inside that wait.
+    const { host, adapter } = await start({ manuals: [httpManual("demo", server, { waitMs: 1000 })] }, 1_500);
+
+    const pending = host.runJson("call", { name: "demo.hang", arguments: {} });
+    await Bun.sleep(200);
+    await adapter.dispose();
+
+    const result = await pending;
+    expect(result.error.code).toBe("TIMEOUT");
+    expect(adapter.status().state).toBe("closed");
+    expect(internals(adapter).abandonedByManual.get("demo")).toBe(1);
+    expect(internals(adapter).abandonHoldTimers.size).toBe(0);
   }, 20_000);
 });

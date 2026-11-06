@@ -19,6 +19,8 @@ import {
 /** Bounds of the per-manual `waitMs` option, in milliseconds (inclusive). */
 export const WAIT_MS_MIN = 1_000;
 export const WAIT_MS_MAX = 600_000;
+/** Longest manual `name` allowed on a manual with `waitMs`; the registry truncates names at this length. */
+export const WAIT_NAME_MAX_LENGTH = 120;
 
 export interface AdapterConfig {
   /** Root used to resolve relative manual paths; never the ambient cwd. */
@@ -172,6 +174,11 @@ function checkWaitMs(candidate: Record<string, unknown>, index: number): string 
   }
   if (rawName.length === 0) {
     return `\`waitMs\` on ${label} requires the manual to have a \`name\`. Add a \`name\` to the manual or remove \`waitMs\`.`;
+  }
+  // Registered manual names are truncated to WAIT_NAME_MAX_LENGTH elsewhere, so a
+  // longer name would not match the key the wait bound and its cap are stored under.
+  if (rawName.length > WAIT_NAME_MAX_LENGTH) {
+    return `\`waitMs\` on ${label} requires the manual's \`name\` to be at most ${WAIT_NAME_MAX_LENGTH} characters. Shorten the \`name\` or remove \`waitMs\`.`;
   }
   const value = candidate.waitMs;
   if (typeof value !== "number" || !Number.isInteger(value) || value < WAIT_MS_MIN || value > WAIT_MS_MAX) {

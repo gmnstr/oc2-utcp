@@ -17,6 +17,7 @@ import {
   MAX_PATTERN_WORKERS,
   compileSchema,
   livePatternWorkerCount,
+  patternWorkersStarted,
   probePatternWorker,
   terminatePatternWorkers,
   validateArgumentsGuarded,
@@ -290,6 +291,110 @@ describe("startup probe of the pattern worker", () => {
     // A worker cannot boot and answer within 1 ms, so the deadline path runs.
     expect(await probePatternWorker(1)).toBe(false);
     await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(livePatternWorkerCount()).toBe(0);
+  }, 20_000);
+
+  test("a passing probe ran its own workers: the worker count rose by at least two during it", async () => {
+    const before = patternWorkersStarted();
+    expect(await probePatternWorker()).toBe(true);
+    expect(patternWorkersStarted() - before).toBeGreaterThanOrEqual(2);
+    expect(livePatternWorkerCount()).toBe(0);
+  }, 20_000);
+});
+
+describe("pattern nested under other keywords reaches the worker guard", () => {
+  // Each schema is supported, reports usesPattern, and refuses a miss through the
+  // guarded path. The worker count must rise, so the refusal came from a worker.
+  const cases: Array<{ label: string; schema: Record<string, unknown>; hit: unknown; miss: unknown }> = [
+    {
+      label: "anyOf",
+      schema: {
+        type: "object",
+        properties: { s: { anyOf: [{ type: "integer" }, { type: "string", pattern: LOWERCASE }] } },
+        required: ["s"],
+      },
+      hit: { s: "abc" },
+      miss: { s: "ABC" },
+    },
+    {
+      label: "items",
+      schema: {
+        type: "object",
+        properties: { xs: { type: "array", items: { type: "string", pattern: LOWERCASE } } },
+      },
+      hit: { xs: ["abc"] },
+      miss: { xs: ["abc", "ABC"] },
+    },
+    {
+      label: "additionalProperties (schema form)",
+      schema: { type: "object", additionalProperties: { type: "string", pattern: LOWERCASE } },
+      hit: { k: "abc" },
+      miss: { k: "ABC" },
+    },
+    {
+      label: "a $defs member reached only through $ref",
+      schema: {
+        type: "object",
+        properties: { s: { $ref: "#/$defs/Word" } },
+        required: ["s"],
+        $defs: { Word: { type: "string", pattern: LOWERCASE } },
+      },
+      hit: { s: "abc" },
+      miss: { s: "ABC" },
+    },
+  ];
+
+  for (const testCase of cases) {
+    test(`${testCase.label}: usesPattern is true and a mismatching value is refused through validateArgumentsGuarded`, async () => {
+      const compiled = compileSchema(testCase.schema);
+      expect(compiled.check.supported).toBe(true);
+      expect(compiled.usesPattern).toBe(true);
+
+      const before = patternWorkersStarted();
+      expect(await validateArgumentsGuarded(compiled, testCase.hit)).toEqual({ ok: true });
+      const refused = await validateArgumentsGuarded(compiled, testCase.miss);
+      expect(refused.ok).toBe(false);
+      expect(patternWorkersStarted() - before).toBeGreaterThanOrEqual(2);
+      expect(livePatternWorkerCount()).toBe(0);
+    }, 20_000);
+  }
+});
+
+describe("dispose and a pattern validation still pending", () => {
+  test("dispose stops a pending pattern validation: the call is refused and never dispatched", async () => {
+    const server: UtcpFixtureServer = startUtcpFixture({
+      tools: [{ name: "pat", inputs: patternSchema(LOWERCASE) }],
+    });
+    cleanup.push(() => server.stop());
+    const host = makeFakeHost({
+      manuals: [
+        {
+          name: "demo",
+          call_template_type: "http",
+          http_method: "GET",
+          url: `${server.url}/manual`,
+          content_type: "application/json",
+        },
+      ],
+    });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => {}, policyBaseline: () => "rule", disposeDeadlineMs: 500 });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    // Validation runs before the permission hook, so the pending point here is the
+    // worker. The call reaches it synchronously, and the worker has not answered yet.
+    const pending = host.runJson("call", { name: "demo.pat", arguments: { s: "abc" } });
+    expect(livePatternWorkerCount()).toBe(1);
+
+    const disposing = adapter.dispose();
+    const result = await pending;
+    await disposing;
+
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe("VALIDATION_FAILED");
+    expect(result.error.message).toBe(STOPPED_MESSAGE);
+    expect(server.hits("pat")).toBe(0);
+    expect(host.asserts).toHaveLength(0);
     expect(livePatternWorkerCount()).toBe(0);
   }, 20_000);
 });

@@ -434,6 +434,33 @@ describe("waitMs configuration (D2 4)", () => {
     expect(await host.listNames()).toEqual([]);
   });
 
+  test("waitMs on a manual whose name is longer than 120 characters is CONFIG_INVALID naming the name", async () => {
+    const { host, adapter } = await startWithTemplate({
+      name: "n".repeat(121),
+      call_template_type: "http",
+      url: "http://127.0.0.1:1/m",
+      waitMs: 1000,
+    });
+
+    expect(adapter.status().state).toBe("closed");
+    expect(adapter.status().error?.code).toBe("CONFIG_INVALID");
+    expect(adapter.status().error?.message).toContain("`name`");
+    expect(adapter.status().error?.message).toContain("120 characters");
+    expect(adapter.status().error?.message).toContain("`waitMs`");
+    expect(await host.listNames()).toEqual([]);
+  });
+
+  test("waitMs on a manual whose name is exactly 120 characters is accepted", async () => {
+    const server = fixture();
+    const host = makeFakeHost({ manuals: [{ ...httpManual("n".repeat(120), server), waitMs: 1000 }] });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined, policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    expect(adapter.status().error).toBeNull();
+    expect(adapter.status().state).toBe("ready");
+  }, 20_000);
+
   test("waitMs at the bounds is accepted on http and sse, and is never forwarded to the SDK", async () => {
     const server = fixture();
     type Register = (templates: Array<Record<string, unknown>>) => Promise<unknown>;

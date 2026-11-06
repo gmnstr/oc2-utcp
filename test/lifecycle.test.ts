@@ -275,6 +275,20 @@ describe("ignored timeout notice (A-timeout)", () => {
     expect(JSON.stringify(events)).not.toContain("4321");
   }, 20_000);
 
+  test("an http manual with both timeout and waitMs still emits the notice, since timeout is ignored either way", async () => {
+    const server = fixture();
+    const host = makeFakeHost({ manuals: [httpManual("demo", server, { timeout: 4321, waitMs: 1000 })] });
+    const events: LogEvent[] = [];
+    const adapter = new UtcpAdapter(host.ctx, { log: (event) => events.push(event), policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    expect(configEvents(events)).toEqual([
+      { event: "config", notice: "timeoutIgnored", manual: "demo", template: "http" },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("4321");
+  }, 20_000);
+
   test("an sse manual with a timeout is reported with template sse", async () => {
     const server = fixture();
     const host = makeFakeHost({ manuals: [httpManual("feed", server, { call_template_type: "sse", timeout: 900 })] });

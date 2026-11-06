@@ -53,9 +53,9 @@ export type LogEvent =
     }
   | {
       /**
-       * Logged once at startup. `available: false` means the pattern worker probe
-       * failed or timed out; the adapter keeps running, and calls to tools whose
-       * schema uses `pattern` are refused.
+       * Logged once at startup. `available: false` means the probe did not confirm
+       * the pattern guard in this runtime. Calls to tools whose schema uses `pattern`
+       * still go through the worker, and fail closed if it cannot run.
        */
       event: "config";
       notice: "patternGuard";

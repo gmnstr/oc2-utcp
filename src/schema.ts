@@ -888,6 +888,14 @@ export function livePatternWorkerCount(): number {
   return livePatternWorkers.size;
 }
 
+/** Pattern-validation workers created since the module loaded. Only ever increases. */
+let patternWorkersCreated = 0;
+
+/** Count of pattern-validation workers created so far; the startup probe reads it to prove a worker ran. */
+export function patternWorkersStarted(): number {
+  return patternWorkersCreated;
+}
+
 /**
  * Stops every in-flight pattern validation. Each one settles at once as a refusal
  * ("stopped"), so nothing waits for a worker that will not answer. Called from dispose.
@@ -933,6 +941,7 @@ function runPatternWorker(schema: unknown, args: unknown, deadlineMs: number): P
       resolve({ kind: "unavailable" });
       return;
     }
+    patternWorkersCreated += 1;
 
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1040,18 +1049,22 @@ const PROBE_SCHEMA = {
  * tiny pattern validations through validateArgumentsGuarded, the same path real
  * calls take: `{s: "a"}` must pass, and `{s: "b"}` must be refused as a pattern
  * miss (the negative control, so a worker that accepts everything is caught).
- * Reports true only when both hold. A timeout, stop or unavailable worker is not
- * a pattern miss and gives false. Any exception gives false; each worker is
- * terminated on every path, and this never throws.
+ * Reports true only when both hold and the probe itself ran workers: the count
+ * from patternWorkersStarted must rise by at least two, one per validation, so a
+ * path that answered without a worker cannot pass. A timeout, stop or unavailable
+ * worker is not a pattern miss and gives false. Any exception gives false; each
+ * worker is terminated on every path, and this never throws.
  */
 export async function probePatternWorker(deadlineMs = 2_000): Promise<boolean> {
   try {
     const compiled = compileSchema(PROBE_SCHEMA);
     if (!compiled.usesPattern || compiled.validate === undefined) return false;
+    const startedBefore = patternWorkersStarted();
     const accepted = await validateArgumentsGuarded(compiled, { s: "a" }, { deadlineMs });
     if (accepted.ok !== true) return false;
     const refused = await validateArgumentsGuarded(compiled, { s: "b" }, { deadlineMs });
-    return refused.ok === false && refused.path === "arguments.s";
+    const workersRan = patternWorkersStarted() - startedBefore >= 2;
+    return workersRan && refused.ok === false && refused.path === "arguments.s";
   } catch {
     return false;
   }
