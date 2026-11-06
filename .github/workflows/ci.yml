@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: typecheck, unit tests, host integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun 1.3.14
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Runs without an OpenCode install: the host suites skip, which is exactly
+      # what a fresh clone sees. Host discovery itself is covered here.
+      - name: Tests
+        run: bun test
+
+      # Install the host the same way a user does: from the public npm package.
+      # The package's postinstall links the platform binary into bin/opencode.exe,
+      # so this also validates the documented install path.
+      - name: Install OpenCode 2.2.5 from npm
+        run: npm install --no-save --no-audit --no-fund --prefix "$RUNNER_TEMP/opencode" @opencode/cli@2.2.5
+
+      - name: Put OpenCode on PATH
+        run: echo "$RUNNER_TEMP/opencode/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Verify installed host
+        run: opencode --version
+
+      # A missing or unusable host must fail the build here rather than skip.
+      - name: Host integration tests
+        env:
+          OC2_REQUIRE_HOST: "1"
+        run: bun test test/host/integration.test.ts test/host/permissions.test.ts
