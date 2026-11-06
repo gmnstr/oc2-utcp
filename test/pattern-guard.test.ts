@@ -192,19 +192,27 @@ describe("pattern schemas (ReDoS guard)", () => {
   }, 20_000);
 });
 
-describe("catastrophic pattern (kill path)", () => {
-  // On a runtime whose regex engine backtracks on this input (Linux CI), the
-  // worker is still running at the deadline and must be terminated; on one that
-  // does not (the local macOS Bun), the validation just finishes. Either way the
-  // call returns inside the bound, fails closed, and leaves no worker behind.
-  test("^(a+)+$ on 45 a's plus '!' returns within the bound and fails closed", async () => {
-    const compiled = compileSchema(patternSchema("^(a+)+$"));
+describe("hostile patterns (kill path)", () => {
+  // One `^(a+)+$` run on 30 a's plus '!' costs roughly 0.7-1 s in Bun's regex
+  // engine (measured in CI), so several of them in one argument object exceed a
+  // 500 ms deadline on any machine. The worker must be terminated at the
+  // deadline: the call returns inside the bound, fails closed with the
+  // time-limit message, and leaves no worker behind.
+  test("several hostile pattern fields together exceed the deadline and are stopped", async () => {
+    const properties: Record<string, unknown> = {};
+    const args: Record<string, string> = {};
+    for (const key of ["a", "b", "c", "d", "e", "f"]) {
+      properties[key] = { type: "string", pattern: "^(a+)+$" };
+      args[key] = `${"a".repeat(30)}!`;
+    }
+    const compiled = compileSchema({ type: "object", properties });
     expect(compiled.check.supported).toBe(true);
     const started = Date.now();
-    const result = await validateArgumentsGuarded(compiled, { s: `${"a".repeat(45)}!` }, { deadlineMs: 500 });
+    const result = await validateArgumentsGuarded(compiled, args, { deadlineMs: 500 });
     const elapsed = Date.now() - started;
-    console.log(`catastrophic-pattern: ${elapsed} ms, ${result.ok ? "ok" : result.message}`);
+    console.log(`hostile-patterns: ${elapsed} ms, ${result.ok ? "ok" : result.message}`);
     expect(result.ok).toBe(false);
+    expect((result as { message: string }).message).toBe(TIME_LIMIT_MESSAGE);
     expect(elapsed).toBeLessThan(3000);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(livePatternWorkerCount()).toBe(0);
