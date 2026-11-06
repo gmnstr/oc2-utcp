@@ -162,7 +162,7 @@ Measurements, from GitHub Actions runs:
 
 `MAX_SCHEMA_NODES`, `MAX_REF_DEPTH`, `MAX_ARG_DEPTH` and `MAX_EVAL_PATHS` are chosen limits, not measured thresholds. `MAX_EVAL_WORK` (500,000) is derived from a measured cost of about 0.7 microseconds per validation path, so one call's worst allowed validator work is about 0.35 s of synchronous CPU.
 
-Arguments have their own work limit. A call's work is the schema's bound times its argument node count, and above `MAX_EVAL_WORK` the arguments are refused before Ajv runs with `arguments are too large for this tool's schema.` A schema that is cheap for one value can be expensive for a long array: a bound of 8,193 with 2,000 items is about 16 million paths, far above the limit. Arguments are also refused before Ajv when they nest deeper than `MAX_ARG_DEPTH` (64), or hold more than `MAX_ARG_NODES` (100,000) values (`arguments contain too many values.`), and a refused argument set is never dispatched. The constants are exported from `src/schema.ts`.
+Arguments have their own work limit. A call's work is the schema's bound times its argument node count, and above `MAX_EVAL_WORK` the arguments are refused before Ajv runs with `arguments are too large for this tool's schema.` A schema that is cheap for one value can be expensive for a long array: a bound of 8,193 with 2,000 items is about 16 million paths, far above the limit. Arguments are also refused before Ajv when they nest deeper than `MAX_ARG_DEPTH` (64), or hold more than `MAX_ARG_NODES` (100,000) values (`arguments contain too many values.`), and a refused argument set is never dispatched. Six of the constants are exported from `src/schema.ts`; `MAX_KEYWORD_ENTRIES` (1,000, the cap on `required` and `enum` entries) is internal. The work limit counts argument values, not string length, so it does not bound `pattern` or `format` cost on long strings.
 - **Only `streamable_http` honours a manual-level `timeout`.** A hung plain-`http` server holds the invocation until the HTTP client's own default of 30 seconds elapses (not tested end to end). MCP servers have their own `timeout`, in seconds, default 30 (see Timeouts).
 
 ### Tested versions
@@ -179,7 +179,7 @@ Arguments have their own work limit. A call's work is the schema's bound times i
 | `ajv-formats` | 3.0.1 | `package.json` dependency; installed `node_modules/ajv-formats` |
 | `zod` | 4.6.7 (direct dependency; used by the MCP SDK) and 3.25.76 (nested under `@utcp/sdk`, which requires `^3.23.8`) | nested resolution kept in `bun.lock` and asserted by `test/deps-zod.test.ts` |
 
-`zod` is a direct dependency that no source file imports. It exists to pin the MCP SDK's hoisted zod to 4.6.7, the patched release for GHSA-mrhx-c7xc-m3w5. `@utcp/sdk` keeps its own nested zod 3.25.76. `test/deps-zod.test.ts` enforces this split and fails on any zod copy that has not been reviewed.
+`zod` is a direct dependency that no source file imports. It exists to pin the MCP SDK's hoisted zod to 4.6.7, the patched release for GHSA-mrhx-c7xc-m3w5. `@utcp/sdk` keeps its own nested zod 3.25.76. `test/deps-zod.test.ts` enforces this split and fails on any change to the zod copies it can see: `node_modules/zod`, one nesting level below each package, and the `bun.lock` entries (a copy nested deeper than that is not scanned).
 
 ## Development
 

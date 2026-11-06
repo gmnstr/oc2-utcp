@@ -145,7 +145,7 @@ describe("MCP registration-time schema dereferencing", () => {
     expect(fx.refServer.executions()).toBe(0);
   }, 20_000);
 
-  test("an https external $ref is unsupported (keyword $ref) and the adapter does not fetch it", async () => {
+  test("an https external $ref is unsupported (keyword $ref) and is refused before dispatch", async () => {
     // example.invalid is reserved and never resolves. The adapter's identity
     // dereference means no fetch is attempted: the tool is described as unsupported
     // by the walk, and a call is refused before permission or dispatch.
