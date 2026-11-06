@@ -9,7 +9,16 @@
 
 import type { CallTemplate } from "@utcp/sdk";
 import { displayText, failure, isObject, type FailureResult } from "./errors.js";
-import { CONFIGURABLE_TRANSPORTS, DEFAULT_TRANSPORTS, type TransportClass } from "./transport.js";
+import {
+  CONFIGURABLE_TRANSPORTS,
+  DEFAULT_TRANSPORTS,
+  normalizeCallTemplateType,
+  type TransportClass,
+} from "./transport.js";
+
+/** Bounds of the per-manual `waitMs` option, in milliseconds (inclusive). */
+export const WAIT_MS_MIN = 1_000;
+export const WAIT_MS_MAX = 600_000;
 
 export interface AdapterConfig {
   /** Root used to resolve relative manual paths; never the ambient cwd. */
@@ -102,6 +111,10 @@ export function loadConfig(rawOptions: unknown, locationDirectory: string | unde
       }
       seenNames.add(sanitized);
     }
+    if (candidate.waitMs !== undefined) {
+      const waitError = checkWaitMs(candidate, index);
+      if (waitError !== null) return configInvalid(waitError);
+    }
     manuals.push(candidate as unknown as CallTemplate);
   }
 
@@ -142,6 +155,25 @@ export function loadConfig(rawOptions: unknown, locationDirectory: string | unde
   }
 
   return { ok: true, config: { rootDir, manuals, transports, toolPatterns } };
+}
+
+/**
+ * Validates a manual's `waitMs`: only `http` and `sse` templates may carry it,
+ * and the value must be an integer within WAIT_MS_MIN..WAIT_MS_MAX. The value
+ * is not echoed; the message names the manual and the key.
+ */
+function checkWaitMs(candidate: Record<string, unknown>, index: number): string | null {
+  const rawName = typeof candidate.name === "string" ? candidate.name.trim() : "";
+  const label = rawName.length > 0 ? `manual '${displayText(rawName.replace(/[^\w]/g, "_"), 80)}'` : `manuals[${index}]`;
+  const type = normalizeCallTemplateType(candidate.call_template_type);
+  if (type !== "http" && type !== "sse") {
+    return `\`waitMs\` on ${label} is supported only on \`http\` and \`sse\` call templates. Remove \`waitMs\` or change the manual's call template type.`;
+  }
+  const value = candidate.waitMs;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < WAIT_MS_MIN || value > WAIT_MS_MAX) {
+    return `\`waitMs\` on ${label} must be an integer number of milliseconds from ${WAIT_MS_MIN} to ${WAIT_MS_MAX}.`;
+  }
+  return null;
 }
 
 /** Compiles an allow pattern with `*` (any run, including `.`) and `?` (one char). */

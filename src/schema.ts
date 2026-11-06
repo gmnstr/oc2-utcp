@@ -171,6 +171,8 @@ function isKnownFormat(name: string): boolean {
 export interface SchemaCheck {
   supported: boolean;
   issues: SchemaIssue[];
+  /** Whether the walk saw a `pattern` keyword anywhere in the schema. */
+  usesPattern: boolean;
   /** Static evaluation bound (validation paths per instance); set only when supported. */
   bound?: number;
 }
@@ -181,6 +183,10 @@ export type ArgumentValidation =
 
 export interface CompiledSchema {
   check: SchemaCheck;
+  /** Copy of `check.usesPattern`: pattern schemas are validated in a worker (see validateArgumentsGuarded). */
+  usesPattern: boolean;
+  /** The original schema object, sent to the pattern worker, which compiles its own validator. */
+  schema: unknown;
   validate?: ValidateFunction;
   /** Evaluation bound of the compiled schema; set only when `validate` is set. */
   bound?: number;
@@ -231,6 +237,7 @@ interface WalkContext {
   readonly root: unknown;
   readonly issues: SchemaIssue[];
   nodes: number;
+  usesPattern: boolean;
 }
 
 function walk(schema: unknown, path: string, depth: number, ctx: WalkContext): void {
@@ -367,6 +374,7 @@ function walk(schema: unknown, path: string, depth: number, ctx: WalkContext): v
         break;
       }
       case "pattern": {
+        ctx.usesPattern = true;
         if (typeof value !== "string") {
           pushIssue(ctx.issues, childPath, "pattern");
           break;
@@ -537,7 +545,7 @@ function evaluationBound(root: Record<string, unknown>): number {
  * the schema is refused rather than reaching Ajv.
  */
 export function checkSchema(schema: unknown): SchemaCheck {
-  const ctx: WalkContext = { root: schema, issues: [], nodes: 0 };
+  const ctx: WalkContext = { root: schema, issues: [], nodes: 0, usesPattern: false };
   let bound: number | undefined;
   try {
     walk(schema, "arguments", 0, ctx);
@@ -552,8 +560,8 @@ export function checkSchema(schema: unknown): SchemaCheck {
   }
   const supported = ctx.issues.length === 0;
   return supported && bound !== undefined
-    ? { supported, issues: ctx.issues, bound }
-    : { supported, issues: ctx.issues };
+    ? { supported, issues: ctx.issues, usesPattern: ctx.usesPattern, bound }
+    : { supported, issues: ctx.issues, usesPattern: ctx.usesPattern };
 }
 
 function toIssue(error: unknown): SchemaIssue {
@@ -564,19 +572,26 @@ function toIssue(error: unknown): SchemaIssue {
   return { path: "arguments", keyword: "<internal>", message: "schema check failed" };
 }
 
+/**
+ * A fresh Ajv with the adapter's options. The pattern worker (pattern-worker.ts)
+ * calls this too, so both sides validate with identical settings.
+ */
+export function makeAjv(): Ajv {
+  const ajv = new Ajv({
+    strict: true,
+    allErrors: true,
+    coerceTypes: false,
+    useDefaults: false,
+    removeAdditional: false,
+  });
+  addFormats(ajv);
+  return ajv;
+}
+
 let sharedAjv: Ajv | null = null;
 
 function getAjv(): Ajv {
-  if (sharedAjv === null) {
-    sharedAjv = new Ajv({
-      strict: true,
-      allErrors: true,
-      coerceTypes: false,
-      useDefaults: false,
-      removeAdditional: false,
-    });
-    addFormats(sharedAjv);
-  }
+  if (sharedAjv === null) sharedAjv = makeAjv();
   return sharedAjv;
 }
 
@@ -599,7 +614,8 @@ const evaluationBounds = new WeakMap<ValidateFunction, number>();
  */
 export function compileSchema(schema: unknown): CompiledSchema {
   const check = checkSchema(schema);
-  if (!check.supported) return { check };
+  const usesPattern = check.usesPattern;
+  if (!check.supported) return { check, usesPattern, schema };
 
   const key = typeof schema === "object" && schema !== null ? schema : null;
   if (key !== null) {
@@ -611,7 +627,7 @@ export function compileSchema(schema: unknown): CompiledSchema {
     const validate = getAjv().compile(schema as JsonSchema);
     const bound = check.bound ?? MAX_EVAL_PATHS;
     evaluationBounds.set(validate, bound);
-    const result: CompiledSchema = { check, validate, bound };
+    const result: CompiledSchema = { check, usesPattern, schema, validate, bound };
     if (key !== null) compiled.set(key, result);
     return result;
   } catch (error) {
@@ -626,7 +642,10 @@ export function compileSchema(schema: unknown): CompiledSchema {
       check: {
         supported: false,
         issues: [{ path: "arguments", keyword: "compile", message: displayText(message, 300) }],
+        usesPattern,
       },
+      usesPattern,
+      schema,
     };
   }
 }
@@ -794,13 +813,24 @@ const ARGUMENTS_TOO_LARGE: ArgumentValidation = {
  * validator this module did not compile is assumed to have the largest bound.
  */
 export function validateArguments(validate: ValidateFunction, args: unknown): ArgumentValidation {
+  const refused = refuseBeforeValidation(args, evaluationBounds.get(validate) ?? MAX_EVAL_PATHS);
+  return refused ?? runValidator(validate, args);
+}
+
+/**
+ * The refusals that run before Ajv sees the arguments: nesting, value count and
+ * the work limit (schema bound times node count). Undefined when they all pass.
+ */
+function refuseBeforeValidation(args: unknown, bound: number): ArgumentValidation | undefined {
   const measured = measureArguments(args);
   if (measured.shape === "deep") return ARGUMENTS_TOO_DEEP;
   if (measured.shape === "many") return ARGUMENTS_TOO_MANY;
-
-  const bound = evaluationBounds.get(validate) ?? MAX_EVAL_PATHS;
   if (bound * measured.nodes > MAX_EVAL_WORK) return ARGUMENTS_TOO_LARGE;
+  return undefined;
+}
 
+/** Runs Ajv on the calling thread and describes the first failure. */
+function runValidator(validate: ValidateFunction, args: unknown): ArgumentValidation {
   let passed: boolean;
   try {
     passed = validate(args) === true;
@@ -823,8 +853,11 @@ export function validateArguments(validate: ValidateFunction, args: unknown): Ar
     };
   }
   if (passed) return { ok: true };
+  return describeFailure(validate.errors, args);
+}
 
-  const first = (validate.errors ?? [])[0];
+function describeFailure(errors: readonly ErrorObject[] | null | undefined, args: unknown): ArgumentValidation {
+  const first = (errors ?? [])[0];
   if (first === undefined) {
     return {
       ok: false,
@@ -835,4 +868,159 @@ export function validateArguments(validate: ValidateFunction, args: unknown): Ar
     };
   }
   return describeAjvError(first, args, "arguments");
+}
+
+/** Deadline for one pattern-schema validation. A worker still running at it is terminated, and the call fails closed. */
+export const PATTERN_DEADLINE_MS = 2_000;
+/** Pattern-validation workers allowed at once. A call over this is refused, not queued. */
+export const MAX_PATTERN_WORKERS = 8;
+
+/** Workers currently running a pattern validation, each with the function that stops it. */
+const livePatternWorkers = new Map<Worker, () => void>();
+
+/** Live pattern-validation workers, for tests and diagnostics. */
+export function livePatternWorkerCount(): number {
+  return livePatternWorkers.size;
+}
+
+/**
+ * Stops every in-flight pattern validation. Each one settles at once as a refusal
+ * ("stopped"), so nothing waits for a worker that will not answer. Called from dispose.
+ */
+export function terminatePatternWorkers(): void {
+  for (const stop of [...livePatternWorkers.values()]) stop();
+}
+
+/** An Ajv error reduced to plain JSON, as the pattern worker posts it. */
+interface WorkerError {
+  keyword: string;
+  instancePath: string;
+  params: Record<string, unknown>;
+  message?: string;
+}
+
+type WorkerOutcome =
+  | { kind: "reply"; valid: boolean; errors: WorkerError[] }
+  | { kind: "timeout" }
+  | { kind: "stopped" }
+  | { kind: "unavailable" };
+
+function readReply(data: unknown): WorkerOutcome {
+  if (!isRecord(data) || data["crashed"] === true) return { kind: "unavailable" };
+  const valid = data["valid"];
+  const errors = data["errors"];
+  if (typeof valid !== "boolean" || !Array.isArray(errors)) return { kind: "unavailable" };
+  return { kind: "reply", valid, errors: errors as WorkerError[] };
+}
+
+/**
+ * Runs one validation in a fresh worker and resolves once, whatever happens: a
+ * reply, the deadline, a stop, or a worker that cannot be created or errors. The
+ * worker is terminated on every path, and it is registered in livePatternWorkers
+ * until then.
+ */
+function runPatternWorker(schema: unknown, args: unknown, deadlineMs: number): Promise<WorkerOutcome> {
+  return new Promise<WorkerOutcome>((resolve) => {
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL("./pattern-worker.ts", import.meta.url));
+    } catch {
+      resolve({ kind: "unavailable" });
+      return;
+    }
+
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (outcome: WorkerOutcome): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      livePatternWorkers.delete(worker);
+      try {
+        worker.terminate();
+      } catch {
+        // Already gone; the outcome is what matters.
+      }
+      resolve(outcome);
+    };
+
+    livePatternWorkers.set(worker, () => finish({ kind: "stopped" }));
+    timer = setTimeout(() => finish({ kind: "timeout" }), deadlineMs);
+    worker.onmessage = (event: MessageEvent) => finish(readReply(event.data));
+    worker.onerror = () => finish({ kind: "unavailable" });
+    try {
+      worker.postMessage({ schema, args });
+    } catch {
+      finish({ kind: "unavailable" });
+    }
+  });
+}
+
+/**
+ * Validates arguments with the same pre-checks as validateArguments. A schema
+ * without `pattern` takes the synchronous path unchanged. A schema with `pattern`
+ * is validated in a worker that is terminated at the deadline, so a catastrophic
+ * regex cannot freeze the host. Every failure of that worker path fails closed:
+ * the call is refused, never dispatched, and there is no synchronous fallback.
+ */
+export async function validateArgumentsGuarded(
+  compiled: CompiledSchema,
+  args: unknown,
+  options: { deadlineMs?: number } = {},
+): Promise<ArgumentValidation> {
+  const validate = compiled.validate;
+  if (validate === undefined) {
+    return {
+      ok: false,
+      path: "arguments",
+      expected: "compiled schema",
+      received: "none",
+      message: "the tool's schema is not compiled.",
+    };
+  }
+
+  const refused = refuseBeforeValidation(args, compiled.bound ?? MAX_EVAL_PATHS);
+  if (refused !== undefined) return refused;
+  if (!compiled.usesPattern) return runValidator(validate, args);
+
+  if (livePatternWorkers.size >= MAX_PATTERN_WORKERS) {
+    return {
+      ok: false,
+      path: "arguments",
+      expected: "a free validation slot",
+      received: "too many validations in flight",
+      message: "too many concurrent validations.",
+    };
+  }
+
+  const outcome = await runPatternWorker(compiled.schema, args, options.deadlineMs ?? PATTERN_DEADLINE_MS);
+  switch (outcome.kind) {
+    case "reply":
+      if (outcome.valid) return { ok: true };
+      return describeFailure(outcome.errors as unknown as ErrorObject[], args);
+    case "timeout":
+      return {
+        ok: false,
+        path: "arguments",
+        expected: "validation within the time limit",
+        received: "validation timed out",
+        message: "validation of the arguments exceeded the time limit.",
+      };
+    case "stopped":
+      return {
+        ok: false,
+        path: "arguments",
+        expected: "validation to finish",
+        received: "validation stopped",
+        message: "validation of the arguments was stopped before it finished.",
+      };
+    case "unavailable":
+      return {
+        ok: false,
+        path: "arguments",
+        expected: "pattern validation available",
+        received: "no pattern validation",
+        message: "pattern validation is unavailable in this runtime.",
+      };
+  }
 }

@@ -17,6 +17,10 @@ export type LogEvent =
       durationMs: number;
       ok: boolean;
       code?: string;
+      /** Present only for a call the adapter stopped awaiting at its `waitMs` deadline. */
+      timedOut?: true;
+      /** The manual's `waitMs`, present together with `timedOut`. */
+      waitMs?: number;
       sessionID: string;
       invocationID: string;
     }

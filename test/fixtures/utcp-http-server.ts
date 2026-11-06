@@ -11,6 +11,13 @@ export interface FixtureTool {
   respond?: unknown;
   /** Holds the `/call/<name>` response for this long, so a caller can abort mid-flight. */
   delayMs?: number;
+  /** Status for `/call/<name>`; a non-2xx status makes the transport reject. */
+  status?: number;
+  /**
+   * Holds each `/call/<name>` request until the test releases it with
+   * `releaseOne()` or `stop()`. The hit is counted before the hold.
+   */
+  hold?: boolean;
 }
 
 export interface UtcpFixtureServer {
@@ -20,6 +27,8 @@ export interface UtcpFixtureServer {
   total(): number;
   /** Replaces the served manual's tool list (simulates a server-side change). */
   setTools(tools: FixtureTool[]): void;
+  /** Releases the oldest held `/call/` request; returns false when none is held. */
+  releaseOne(): boolean;
   stop(): void;
 }
 
@@ -56,6 +65,7 @@ export function startUtcpFixture(options: FixtureOptions = {}): UtcpFixtureServe
   const calls = new Map<string, number>();
   let tools: FixtureTool[] = (options.tools ?? []).slice();
   let baseUrl = "";
+  const held: Array<() => void> = [];
 
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -91,8 +101,14 @@ export function startUtcpFixture(options: FixtureOptions = {}): UtcpFixtureServe
         }
         const query = Object.fromEntries(url.searchParams.entries());
         const configured = tools.find((candidate) => candidate.name === tool);
+        if (configured !== undefined && configured.hold === true) {
+          await new Promise<void>((resolve) => held.push(resolve));
+        }
         if (configured !== undefined && configured.delayMs !== undefined) {
           await Bun.sleep(configured.delayMs);
+        }
+        if (configured !== undefined && configured.status !== undefined && configured.status !== 200) {
+          return new Response("fixture failure", { status: configured.status });
         }
         if (configured !== undefined && configured.respond !== undefined) {
           return Response.json(configured.respond);
@@ -114,7 +130,20 @@ export function startUtcpFixture(options: FixtureOptions = {}): UtcpFixtureServe
     setTools: (next) => {
       tools = next.slice();
     },
-    stop: () => server.stop(true),
+    releaseOne: () => {
+      const resolve = held.shift();
+      if (resolve === undefined) return false;
+      resolve();
+      return true;
+    },
+    stop: () => {
+      // Held requests are released first so no handler is left pending. Their
+      // responses get a short grace period before the sockets are closed.
+      const releasing = held.length > 0;
+      while (held.length > 0) held.shift()?.();
+      if (releasing) setTimeout(() => server.stop(true), 100);
+      else server.stop(true);
+    },
   };
 }
 

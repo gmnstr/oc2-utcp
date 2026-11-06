@@ -9,6 +9,8 @@ import { mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { UtcpClient } from "@utcp/sdk";
+
 import { UtcpAdapter, createUtcpPlugin, UtcpAlreadyActiveError } from "../src/plugin.js";
 import type { LogEvent } from "../src/log.js";
 import { makeFakeHost, type FakeHost } from "./helpers/host.js";
@@ -382,6 +384,73 @@ describe("configuration location", () => {
     expect(adapter.status().state).toBe("ready");
     await adapter.dispose();
   });
+});
+
+describe("waitMs configuration (D2 4)", () => {
+  async function startWithTemplate(template: Record<string, unknown>) {
+    const host = makeFakeHost({ manuals: [template] });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined, policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+    return { host, adapter };
+  }
+
+  const mcpServers = { s: { transport: "http", url: "http://127.0.0.1:1/mcp" } };
+
+  test.each([
+    ["streamable_http", { name: "demo", call_template_type: "streamable_http", url: "http://127.0.0.1:1/m" }, "'demo'"],
+    ["mcp", { name: "demo", call_template_type: "mcp", config: { mcpServers } }, "'demo'"],
+    ["file", { name: "demo", call_template_type: "file", file_path: "/tmp/work/manual.md" }, "'demo'"],
+    ["http below range", { name: "demo", call_template_type: "http", url: "http://127.0.0.1:1/m", waitMs: 999 }, "'demo'"],
+    ["http above range", { name: "demo", call_template_type: "http", url: "http://127.0.0.1:1/m", waitMs: 600_001 }, "'demo'"],
+    ["http fractional", { name: "demo", call_template_type: "http", url: "http://127.0.0.1:1/m", waitMs: 1500.5 }, "'demo'"],
+    ["http string", { name: "demo", call_template_type: "http", url: "http://127.0.0.1:1/m", waitMs: "1500" }, "'demo'"],
+    ["http null", { name: "demo", call_template_type: "http", url: "http://127.0.0.1:1/m", waitMs: null }, "'demo'"],
+    ["unnamed http", { call_template_type: "http", url: "http://127.0.0.1:1/m", waitMs: 999 }, "manuals[0]"],
+  ])("waitMs on %s is CONFIG_INVALID naming the manual and key", async (_label, template, label) => {
+    const waitMs = (template as { waitMs?: unknown }).waitMs;
+    const withWait = waitMs === undefined ? { ...template, waitMs: 1000 } : template;
+    const { host, adapter } = await startWithTemplate(withWait);
+
+    expect(adapter.status().state).toBe("closed");
+    expect(adapter.status().error?.code).toBe("CONFIG_INVALID");
+    expect(adapter.status().error?.message).toContain(label);
+    expect(adapter.status().error?.message).toContain("waitMs");
+    expect(await host.listNames()).toEqual([]);
+  });
+
+  test("waitMs at the bounds is accepted on http and sse, and is never forwarded to the SDK", async () => {
+    const server = fixture();
+    type Register = (templates: Array<Record<string, unknown>>) => Promise<unknown>;
+    const proto = UtcpClient.prototype as unknown as { registerManuals: Register };
+    const original: Register = proto.registerManuals;
+    const forwarded: Array<Record<string, unknown>> = [];
+    proto.registerManuals = function (this: unknown, templates: Array<Record<string, unknown>>) {
+      forwarded.push(...templates);
+      return original.call(this, templates);
+    };
+    try {
+      const host = makeFakeHost({
+        manuals: [
+          { ...httpManual("low", server), waitMs: 1000 },
+          { ...httpManual("high", server), waitMs: 600_000 },
+          { ...httpManual("feed", server), call_template_type: "sse", waitMs: 1000 },
+        ],
+      });
+      const adapter = new UtcpAdapter(host.ctx, { log: () => undefined, policyBaseline: () => "rule" });
+      await adapter.start();
+      cleanup.push(() => adapter.dispose());
+
+      expect(adapter.status().error).toBeNull();
+      expect(adapter.status().state).toBe("ready");
+      expect(adapter.status().manuals.find((entry) => entry.name === "low")?.registered).toBe(true);
+      expect(adapter.status().manuals.find((entry) => entry.name === "high")?.registered).toBe(true);
+      expect(forwarded).toHaveLength(3);
+      expect(forwarded.some((template) => "waitMs" in template)).toBe(false);
+    } finally {
+      proto.registerManuals = original;
+    }
+  }, 20_000);
 });
 
 describe("permission ask shape", () => {
