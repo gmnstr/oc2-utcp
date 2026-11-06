@@ -394,9 +394,9 @@ describe("schema subset", () => {
   }, 20_000);
 
   test("a $schema other than draft-07 is rejected, and draft-07 is accepted", async () => {
-    // The walk accepts `$schema` only as one of the four draft-07 spellings:
-    // the adapter compiles with Ajv draft-07 semantics, so a 2020-12 schema
-    // would be validated by the wrong rules if it were let through.
+    // The walk accepts `$schema` only as one of the two `http://` draft-07 spellings
+    // (with or without `#`): the adapter compiles with Ajv draft-07 semantics, so a
+    // 2020-12 schema would be validated by the wrong rules if it were let through.
     const server = fixture({
       tools: [
         {

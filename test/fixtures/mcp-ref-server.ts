@@ -40,12 +40,53 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
   });
 }
 
-export function startRefMcpServer(options: { ref: string; toolName?: string }): RefMcpServer {
+/**
+ * Input schema advertised when `localRef` is set: a reference into the same document,
+ * which the adapter validates itself. Nothing outside the document is named.
+ */
+export const LOCAL_REF_INPUT_SCHEMA = {
+  type: "object",
+  properties: { item: { $ref: "#/$defs/Item" } },
+  required: ["item"],
+  $defs: {
+    Item: {
+      type: "object",
+      properties: { n: { type: "integer" } },
+      required: ["n"],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * Options. Either `ref` (an external reference placed under `secret`, the original
+ * fixture) or `localRef: true` (a tool whose schema refers only to its own `$defs`).
+ */
+export interface RefMcpServerOptions {
+  ref?: string;
+  localRef?: boolean;
+  toolName?: string;
+}
+
+export function startRefMcpServer(options: RefMcpServerOptions): RefMcpServer {
   let listings = 0;
   let executions = 0;
   let sessions = 0;
 
   const toolName = options.toolName ?? "sneaky";
+  if (options.localRef !== true && options.ref === undefined) {
+    throw new Error("startRefMcpServer needs `ref` or `localRef: true`");
+  }
+  const inputSchema =
+    options.localRef === true
+      ? LOCAL_REF_INPUT_SCHEMA
+      : {
+          type: "object",
+          properties: {
+            secret: { $ref: options.ref },
+          },
+          additionalProperties: false,
+        };
 
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -93,14 +134,10 @@ export function startRefMcpServer(options: { ref: string; toolName?: string }): 
             tools: [
               {
                 name: toolName,
-                description: "A tool whose input schema points outside the document.",
-                inputSchema: {
-                  type: "object",
-                  properties: {
-                    secret: { $ref: options.ref },
-                  },
-                  additionalProperties: false,
-                },
+                description: options.localRef === true
+                  ? "A tool whose input schema refers only to its own $defs."
+                  : "A tool whose input schema points outside the document.",
+                inputSchema,
               },
             ],
           },

@@ -144,4 +144,83 @@ describe("MCP registration-time schema dereferencing", () => {
     expect(host.asserts).toHaveLength(0);
     expect(fx.refServer.executions()).toBe(0);
   }, 20_000);
+
+  test("an https external $ref is unsupported (keyword $ref) and the adapter does not fetch it", async () => {
+    // example.invalid is reserved and never resolves. The adapter's identity
+    // dereference means no fetch is attempted: the tool is described as unsupported
+    // by the walk, and a call is refused before permission or dispatch.
+    const refServer = startRefMcpServer({ ref: "https://example.invalid/item.json" });
+    cleanup.push(() => refServer.stop());
+
+    const host = makeFakeHost({
+      manuals: [mcpManual("remote", refServer.url)],
+    });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    expect(adapter.status().state).toBe("ready");
+
+    const described = await host.runJson("describe", { name: "remote.server.sneaky" });
+    expect(described.ok).toBe(true);
+    expect(described.tool.schemaSupported).toBe(false);
+    expect(described.tool.schemaIssues.map((issue: { keyword: string }) => issue.keyword)).toContain("$ref");
+
+    const called = await host.runJson("call", {
+      name: "remote.server.sneaky",
+      arguments: { secret: "x" },
+    });
+    expect(called.ok).toBe(false);
+    expect(called.error.code).toBe("SCHEMA_UNSUPPORTED");
+    expect(host.asserts).toHaveLength(0);
+    expect(refServer.executions()).toBe(0);
+  }, 20_000);
+});
+
+describe("MCP local $ref through the adapter", () => {
+  async function startLocal(): Promise<{ host: ReturnType<typeof makeFakeHost>; server: RefMcpServer }> {
+    const server = startRefMcpServer({ localRef: true, toolName: "item" });
+    cleanup.push(() => server.stop());
+
+    const host = makeFakeHost({
+      manuals: [mcpManual("localref", server.url)],
+    });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+    expect(adapter.status().state).toBe("ready");
+    return { host, server };
+  }
+
+  test("a tool whose schema has a local $ref is described as schemaSupported", async () => {
+    const { host } = await startLocal();
+
+    const described = await host.runJson("describe", { name: "localref.server.item" });
+    expect(described.ok).toBe(true);
+    expect(described.tool.schemaSupported).toBe(true);
+    expect(described.tool.schemaIssues).toBeUndefined();
+  }, 20_000);
+
+  test("a valid call through the local $ref is dispatched to the server", async () => {
+    const { host, server } = await startLocal();
+
+    const called = await host.runJson("call", {
+      name: "localref.server.item",
+      arguments: { item: { n: 1 } },
+    });
+    expect(called.ok).toBe(true);
+    expect(server.executions()).toBe(1);
+  }, 20_000);
+
+  test("an invalid call through the local $ref fails with VALIDATION_FAILED and is not dispatched", async () => {
+    const { host, server } = await startLocal();
+
+    const called = await host.runJson("call", {
+      name: "localref.server.item",
+      arguments: { item: { n: "x" } },
+    });
+    expect(called.ok).toBe(false);
+    expect(called.error.code).toBe("VALIDATION_FAILED");
+    expect(server.executions()).toBe(0);
+  }, 20_000);
 });

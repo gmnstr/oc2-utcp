@@ -41,6 +41,7 @@ Be aware of the following, which are documented behaviour rather than defects:
 - Manifests are fetched and MCP servers may be contacted **during plugin initialization**, before any per-call approval.
 - `mcp-stdio` manuals can **create a child process** at registration time. The class is disabled by default; enable it only for servers you trust.
 - The UTCP SDK and protocol packages (for example `@utcp/http`) write their own diagnostics to **stdout and stderr**, independently of this adapter, and those diagnostics may contain queries, tool names and URLs. SDK lines interleave with the adapter's `[oc2-utcp]` lines on stderr.
+- **`pattern` regexes run on the host event loop before permission and dispatch.** The `pattern` keyword (supported since 0.1.0) is evaluated by a backtracking regex engine against model-supplied strings. A manual that advertises a catastrophic pattern such as `^(a+)+$` can freeze the host process with a short input. This is unchanged from 0.1.x and has no mitigation in this release; enable only manuals you trust. This is also why `patternProperties` is rejected.
 - Tool calls are authorized by the host's `utcp` permission action. Configuring a tool does not by itself guarantee a human approval step; set an `ask` policy as described in the README.
 
 Out of scope: vulnerabilities in OpenCode itself, in the UTCP SDK packages, or in remote services the operator chooses to connect to. Report those upstream.

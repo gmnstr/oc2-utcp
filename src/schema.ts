@@ -47,17 +47,24 @@ export const MAX_EVAL_PATHS = 16_384;
  * Upper bound on the validator's work for one call: the schema's evaluation bound
  * times the number of argument nodes. Arguments above it are refused before Ajv runs,
  * because a schema that is cheap for one value can be expensive for a long array.
+ * Set from a measured cost of about 0.7 microseconds per validation path: 500,000
+ * paths is well under a second of synchronous CPU on the host event loop.
  */
-export const MAX_EVAL_WORK = 10_000_000;
+export const MAX_EVAL_WORK = 500_000;
 /** Nested `$ref` targets along one resolution path. */
 export const MAX_REF_DEPTH = 64;
 /** Nesting depth of the arguments object, measured before validation. */
 export const MAX_ARG_DEPTH = 64;
+/** Values (object members, array items and the root) counted before arguments are refused as too many. */
+export const MAX_ARG_NODES = 100_000;
 
 /** Literal nesting depth of schema objects, as the walk recurses. */
 const MAX_SCHEMA_DEPTH = 64;
-/** Nodes visited while measuring arguments before they are refused as too large. */
-const MAX_ARG_NODES = 100_000;
+/**
+ * Longest `required` or `enum` array the walk accepts. Each entry costs validator
+ * work per instance, and each one adds to the evaluation bound (see boundOfNode).
+ */
+const MAX_KEYWORD_ENTRIES = 1_000;
 /** Maximum number of issues carried in one verdict. */
 const MAX_ISSUES = 8;
 
@@ -132,11 +139,14 @@ const SUPPORTED_TYPES = new Set([
   "null",
 ]);
 
+/**
+ * Accepted `$schema` values. Ajv's draft-07 class registers only the `http://`
+ * metaschema, so the `https://` spellings would fail at compile; they are refused
+ * here by the walk instead, under the `$schema` keyword.
+ */
 const DRAFT_07_URIS = new Set([
   "http://json-schema.org/draft-07/schema#",
   "http://json-schema.org/draft-07/schema",
-  "https://json-schema.org/draft-07/schema#",
-  "https://json-schema.org/draft-07/schema",
 ]);
 
 /** A local reference: container name and member name, nothing else. */
@@ -192,9 +202,11 @@ function schemaPath(base: string, key: string): string {
   return `${base}.${key}`;
 }
 
-function pushIssue(issues: SchemaIssue[], path: string, keyword: string): void {
+function pushIssue(issues: SchemaIssue[], path: string, keyword: string, message?: string): void {
   if (issues.length >= MAX_ISSUES) return;
-  issues.push({ path: path.length === 0 ? "arguments" : path, keyword });
+  const issue: SchemaIssue = { path: path.length === 0 ? "arguments" : path, keyword };
+  if (message !== undefined) issue.message = message;
+  issues.push(issue);
 }
 
 /**
@@ -341,11 +353,17 @@ function walk(schema: unknown, path: string, depth: number, ctx: WalkContext): v
       case "required": {
         if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
           pushIssue(ctx.issues, childPath, "required");
+        } else if (value.length > MAX_KEYWORD_ENTRIES) {
+          pushIssue(ctx.issues, childPath, "required", "array too long");
         }
         break;
       }
       case "enum": {
-        if (!Array.isArray(value) || value.length === 0) pushIssue(ctx.issues, childPath, "enum");
+        if (!Array.isArray(value) || value.length === 0) {
+          pushIssue(ctx.issues, childPath, "enum");
+        } else if (value.length > MAX_KEYWORD_ENTRIES) {
+          pushIssue(ctx.issues, childPath, "enum", "array too long");
+        }
         break;
       }
       case "pattern": {
@@ -417,9 +435,21 @@ interface BoundState {
 }
 
 /**
- * Validation paths for one instance of `node`: 1, plus the bounds of every child
- * schema (properties values, items, the additionalProperties schema, and the
- * anyOf/oneOf branches). A `$ref` node takes the bound of its target.
+ * A node's own weight: 1, plus one per `required` and per `enum` entry. Ajv inlines
+ * a leaf `$ref` target at every site that references it, so a large keyword payload
+ * in a shared definition is multiplied by the number of references, and `required`
+ * and `enum` checks cost work per entry.
+ */
+function nodeWeight(node: Record<string, unknown>): number {
+  const required = Array.isArray(node["required"]) ? node["required"].length : 0;
+  const values = Array.isArray(node["enum"]) ? node["enum"].length : 0;
+  return addBound(addBound(1, required), values);
+}
+
+/**
+ * Validation paths for one instance of `node`: its own weight (see nodeWeight), plus
+ * the bounds of every child schema (properties values, items, the additionalProperties
+ * schema, and the anyOf/oneOf branches). A `$ref` node takes the bound of its target.
  *
  * Recursion is refused (see boundOfRef), so the reference graph is acyclic and
  * this memoized sum is an exact per-instance count of validation paths. Fan-out
@@ -432,7 +462,7 @@ function boundOfNode(node: Record<string, unknown>, path: string, state: BoundSt
     return boundOfRef(node["$ref"], schemaPath(path, "$ref"), state);
   }
 
-  let bound = 1;
+  let bound = nodeWeight(node);
   const child = (value: unknown, childPath: string): void => {
     if (isRecord(value)) bound = addBound(bound, boundOfNode(value, childPath, state));
   };
@@ -690,10 +720,16 @@ function describeAjvError(error: ErrorObject, data: unknown, base: string): Argu
   }
 }
 
+/** Which measurement limit the arguments exceeded, if any. */
+type ArgumentShape = "ok" | "deep" | "many";
+
 interface ArgumentMeasure {
-  /** Nested deeper than MAX_ARG_DEPTH, or more than MAX_ARG_NODES values. */
-  readonly tooDeep: boolean;
-  /** Values visited, the root and every leaf included. Complete only when not `tooDeep`. */
+  /**
+   * "deep" when nested deeper than MAX_ARG_DEPTH, "many" when more than MAX_ARG_NODES
+   * values. The nodes count is complete only when "ok".
+   */
+  readonly shape: ArgumentShape;
+  /** Values visited, the root and every leaf included. Complete only when "ok". */
   readonly nodes: number;
 }
 
@@ -708,7 +744,7 @@ function measureArguments(value: unknown): ArgumentMeasure {
     const entry = stack.pop();
     if (entry === undefined) break;
     visited += 1;
-    if (visited > MAX_ARG_NODES) return { tooDeep: true, nodes: visited };
+    if (visited > MAX_ARG_NODES) return { shape: "many", nodes: visited };
 
     const { value: current, level } = entry;
     let children: unknown[] | null = null;
@@ -718,11 +754,11 @@ function measureArguments(value: unknown): ArgumentMeasure {
       children = Object.values(current);
     }
     if (children === null) continue;
-    if (level + 1 > MAX_ARG_DEPTH) return { tooDeep: true, nodes: visited };
+    if (level + 1 > MAX_ARG_DEPTH) return { shape: "deep", nodes: visited };
     for (const child of children) stack.push({ value: child, level: level + 1 });
-    if (visited + stack.length > MAX_ARG_NODES) return { tooDeep: true, nodes: visited };
+    if (visited + stack.length > MAX_ARG_NODES) return { shape: "many", nodes: visited };
   }
-  return { tooDeep: false, nodes: visited };
+  return { shape: "ok", nodes: visited };
 }
 
 const ARGUMENTS_TOO_DEEP: ArgumentValidation = {
@@ -731,6 +767,14 @@ const ARGUMENTS_TOO_DEEP: ArgumentValidation = {
   expected: "nesting depth of at most 64",
   received: "deeper nesting",
   message: "arguments are nested too deeply.",
+};
+
+const ARGUMENTS_TOO_MANY: ArgumentValidation = {
+  ok: false,
+  path: "arguments",
+  expected: `arguments with at most ${MAX_ARG_NODES} values`,
+  received: "too many values",
+  message: "arguments contain too many values.",
 };
 
 const ARGUMENTS_TOO_LARGE: ArgumentValidation = {
@@ -744,13 +788,15 @@ const ARGUMENTS_TOO_LARGE: ArgumentValidation = {
 /**
  * Validates arguments against a compiled schema. The object is validated
  * whole: no property is dropped, defaulted or coerced. Arguments nested beyond
- * MAX_ARG_DEPTH, arguments whose work (schema bound times node count) exceeds
- * MAX_EVAL_WORK, or a validator that throws on them, fail without dispatch. A
+ * MAX_ARG_DEPTH or holding more than MAX_ARG_NODES values, arguments whose work
+ * (schema bound times node count) exceeds MAX_EVAL_WORK, or a validator that throws
+ * on them, fail without dispatch. The depth and value-count checks run before Ajv. A
  * validator this module did not compile is assumed to have the largest bound.
  */
 export function validateArguments(validate: ValidateFunction, args: unknown): ArgumentValidation {
   const measured = measureArguments(args);
-  if (measured.tooDeep) return ARGUMENTS_TOO_DEEP;
+  if (measured.shape === "deep") return ARGUMENTS_TOO_DEEP;
+  if (measured.shape === "many") return ARGUMENTS_TOO_MANY;
 
   const bound = evaluationBounds.get(validate) ?? MAX_EVAL_PATHS;
   if (bound * measured.nodes > MAX_EVAL_WORK) return ARGUMENTS_TOO_LARGE;

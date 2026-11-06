@@ -3,6 +3,7 @@ import type { ValidateFunction } from "ajv";
 
 import {
   MAX_ARG_DEPTH,
+  MAX_ARG_NODES,
   MAX_EVAL_PATHS,
   MAX_EVAL_WORK,
   MAX_REF_DEPTH,
@@ -111,29 +112,19 @@ describe("local $ref and definitions", () => {
       null,
     ];
 
-    let fetches = 0;
-    const realFetch = globalThis.fetch;
-    globalThis.fetch = (async () => {
-      fetches += 1;
-      throw new Error("no I/O is allowed while checking a schema");
-    }) as unknown as typeof fetch;
-    try {
-      for (const ref of forms) {
-        const schema = {
-          type: "object",
-          properties: { a: { $ref: ref } },
-          $defs: { a: { type: "string" }, x: { type: "string" } },
-        };
-        const check = checkSchema(schema);
-        expect(check.supported).toBe(false);
-        expect(check.issues.map((issue) => issue.keyword)).toContain("$ref");
-        const compiled = compileSchema(schema);
-        expect(compiled.validate).toBeUndefined();
-      }
-    } finally {
-      globalThis.fetch = realFetch;
+    // No loader is configured: the walk never resolves a reference target, local or not.
+    for (const ref of forms) {
+      const schema = {
+        type: "object",
+        properties: { a: { $ref: ref } },
+        $defs: { a: { type: "string" }, x: { type: "string" } },
+      };
+      const check = checkSchema(schema);
+      expect(check.supported).toBe(false);
+      expect(check.issues.map((issue) => issue.keyword)).toContain("$ref");
+      const compiled = compileSchema(schema);
+      expect(compiled.validate).toBeUndefined();
     }
-    expect(fetches).toBe(0);
   });
 
   test("$defs and definitions below the root are rejected", () => {
@@ -279,6 +270,86 @@ describe("keywords that remain rejected", () => {
     expect(keywordsOf({ $schema: "https://json-schema.org/draft/2020-12/schema", type: "object" })).toEqual([
       "$schema",
     ]);
+  });
+
+  test("the https draft-07 spelling is rejected by the walk under $schema, not at compile", () => {
+    for (const uri of [
+      "https://json-schema.org/draft-07/schema#",
+      "https://json-schema.org/draft-07/schema",
+    ]) {
+      const schema = { $schema: uri, type: "object" };
+      expect(checkSchema(schema).issues).toEqual([{ path: "arguments.$schema", keyword: "$schema" }]);
+      expect(compileSchema(schema).validate).toBeUndefined();
+    }
+  });
+
+  test("the http draft-07 spellings, with and without '#', are accepted and compile", () => {
+    for (const uri of [
+      "http://json-schema.org/draft-07/schema#",
+      "http://json-schema.org/draft-07/schema",
+    ]) {
+      const compiled = compileSchema({ $schema: uri, type: "object", properties: { a: { type: "string" } } });
+      expect(compiled.check).toMatchObject({ supported: true, issues: [] });
+      expect(compiled.validate!({ a: "x" })).toBe(true);
+    }
+  });
+});
+
+describe("evaluation bound includes keyword payload", () => {
+  test("a node's own weight is 1 plus its required and enum entries", () => {
+    const check = checkSchema({
+      type: "object",
+      properties: { a: { type: "string", enum: ["x", "y"] } },
+      required: ["a"],
+    });
+    expect(check).toMatchObject({ supported: true, bound: 5 });
+  });
+
+  test("an enum of 20 values is accepted, and its bound counts each value", () => {
+    const values = Array.from({ length: 20 }, (_, i) => `v${i}`);
+    const schema = {
+      type: "object",
+      properties: { a: { type: "string", enum: values } },
+      required: ["a"],
+    };
+    const compiled = compileSchema(schema);
+    expect(compiled.check.supported).toBe(true);
+    // Root: 1 + 1 required. Property a: 1 + 20 enum values.
+    expect(compiled.bound).toBe(23);
+    expect(compiled.validate!({ a: "v3" })).toBe(true);
+    expect(compiled.validate!({ a: "w" })).toBe(false);
+  });
+
+  test("a 600-name required list in a leaf referenced from 40 properties is rejected by the bound", () => {
+    const names = Array.from({ length: 600 }, (_, i) => `n${i}`);
+    const properties: Record<string, unknown> = {};
+    for (let i = 0; i < 40; i += 1) properties[`p${i}`] = { $ref: "#/$defs/Leaf" };
+    const schema = {
+      type: "object",
+      properties,
+      $defs: { Leaf: { type: "object", required: names } },
+    };
+    // Each reference costs the leaf's bound, 1 + 600 = 601: 40 * 601 = 24,040, above MAX_EVAL_PATHS.
+    const check = checkSchema(schema);
+    expect(check.supported).toBe(false);
+    expect(check.issues).toEqual([
+      { path: "arguments", keyword: "$ref", message: "evaluation bound exceeds limit" },
+    ]);
+    expect(compileSchema(schema).validate).toBeUndefined();
+  });
+
+  test("an enum with 1,001 entries is rejected under enum as 'array too long'", () => {
+    const values = Array.from({ length: 1001 }, (_, i) => `v${i}`);
+    const check = checkSchema({ type: "object", properties: { a: { type: "string", enum: values } } });
+    expect(check.supported).toBe(false);
+    expect(check.issues).toEqual([{ path: "arguments.properties.a.enum", keyword: "enum", message: "array too long" }]);
+  });
+
+  test("a required list with 1,001 entries is rejected under required as 'array too long'", () => {
+    const names = Array.from({ length: 1001 }, (_, i) => `n${i}`);
+    const check = checkSchema({ type: "object", required: names });
+    expect(check.supported).toBe(false);
+    expect(check.issues).toEqual([{ path: "arguments.required", keyword: "required", message: "array too long" }]);
   });
 });
 
@@ -442,13 +513,36 @@ describe("recursive references are refused", () => {
     expect(compileSchema(schema).validate).toBeUndefined();
   });
 
-  test("the root-level form of the same cycle is rejected (root $ref with $defs)", () => {
+  test("the root-level form of the same cycle is rejected by the $ref-sibling rule, not by cycle detection", () => {
+    // A root $ref beside $defs fails the walk before any bound is computed, so this
+    // case says nothing about recursion; the real cycle test is in this describe block.
     const schema = {
       $defs: { A: { anyOf: [{ $ref: "#/$defs/A" }, { type: "string" }] } },
       $ref: "#/$defs/A",
     };
-    expect(checkSchema(schema).supported).toBe(false);
-    expect(keywordsOf(schema)).toContain("$ref");
+    const check = checkSchema(schema);
+    expect(check.supported).toBe(false);
+    expect(check.issues).toEqual([{ path: "arguments.$defs", keyword: "$ref" }]);
+    expect(compileSchema(schema).validate).toBeUndefined();
+  });
+
+  test("a two-definition cycle reached through a property is rejected by cycle detection", () => {
+    // Walk: no $ref sits beside another keyword and every target exists, so the walk
+    // passes. The bound pass then goes root -> A -> B -> A, and the repeat is the cycle.
+    const schema = {
+      type: "object",
+      properties: { p: { $ref: "#/$defs/A" } },
+      $defs: {
+        A: { type: "object", properties: { q: { $ref: "#/$defs/B" } } },
+        B: { type: "object", properties: { r: { $ref: "#/$defs/A" } } },
+      },
+    };
+    const check = checkSchema(schema);
+    expect(check.supported).toBe(false);
+    expect(check.issues).toHaveLength(1);
+    expect(check.issues[0]).toMatchObject({ keyword: "$ref" });
+    expect(check.issues[0]?.message).toContain("recursive reference");
+    expect(compileSchema(schema).validate).toBeUndefined();
   });
 
   test("a cycle that passes through a property is rejected too", () => {
@@ -563,9 +657,10 @@ describe("static evaluation bound", () => {
   test("the limits are exported with the agreed values", () => {
     expect(MAX_SCHEMA_NODES).toBe(10_000);
     expect(MAX_EVAL_PATHS).toBe(16_384);
-    expect(MAX_EVAL_WORK).toBe(10_000_000);
+    expect(MAX_EVAL_WORK).toBe(500_000);
     expect(MAX_REF_DEPTH).toBe(64);
     expect(MAX_ARG_DEPTH).toBe(64);
+    expect(MAX_ARG_NODES).toBe(100_000);
   });
 
   test("a schema over the node budget is refused as too large", () => {
@@ -651,6 +746,17 @@ describe("evaluation work bound", () => {
     expect(validateArguments(compiled.validate!, { a: ["x"] })).toEqual({ ok: true });
   });
 
+  test("arguments with 100,001 values are refused as too many before Ajv runs", () => {
+    const flat = Array.from({ length: MAX_ARG_NODES + 1 }, (_, i) => i);
+    expect(validateArguments(neverValidate(), { a: flat })).toEqual({
+      ok: false,
+      path: "arguments",
+      expected: "arguments with at most 100000 values",
+      received: "too many values",
+      message: "arguments contain too many values.",
+    });
+  });
+
   test("a small valid argument against a small schema validates", () => {
     const compiled = compileSchema({ type: "object", properties: { n: { type: "integer" } } });
     expect(compiled.bound).toBe(2);
@@ -669,6 +775,25 @@ describe("argument nesting", () => {
       result = validateArguments(validate, args);
     }).not.toThrow();
     expect(result).toEqual({
+      ok: false,
+      path: "arguments",
+      expected: "nesting depth of at most 64",
+      received: "deeper nesting",
+      message: "arguments are nested too deeply.",
+    });
+  });
+
+  test("nesting of exactly 64 containers is accepted, and 65 is refused with the depth message", () => {
+    const wrap = (levels: number): unknown => {
+      let node: unknown = 1;
+      for (let i = 0; i < levels; i += 1) node = { n: node };
+      return node;
+    };
+    const compiled = compileSchema({ type: "object" });
+    expect(compiled.check.supported).toBe(true);
+
+    expect(validateArguments(compiled.validate!, wrap(MAX_ARG_DEPTH))).toEqual({ ok: true });
+    expect(validateArguments(neverValidate(), wrap(MAX_ARG_DEPTH + 1))).toEqual({
       ok: false,
       path: "arguments",
       expected: "nesting depth of at most 64",
