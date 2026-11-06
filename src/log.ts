@@ -36,6 +36,16 @@ export type LogEvent =
       transport: string;
       registered: boolean;
       toolCount: number;
+    }
+  | {
+      /**
+       * An `http` or `sse` manual carries a `timeout` the transport never reads
+       * (only `streamable_http` honours it). The value is deliberately omitted.
+       */
+      event: "config";
+      notice: "timeoutIgnored";
+      manual: string;
+      template: "http" | "sse";
     };
 
 export interface Logger {

@@ -19,7 +19,13 @@ import type { CallTemplate, JsonSchema, Tool } from "@utcp/sdk";
 
 import { compileToolPattern, loadConfig, matchesAnyPattern, type AdapterConfig } from "./config.js";
 import { installNoRetryMcpProtocol, uninstallNoRetryMcpProtocol, type NoRetryInstallation } from "./mcp-no-retry.js";
-import { classifyManual, classifyTool, isEnabled, type TransportClass } from "./transport.js";
+import {
+  classifyManual,
+  classifyTool,
+  isEnabled,
+  normalizeCallTemplateType,
+  type TransportClass,
+} from "./transport.js";
 import { compileSchema, validateArguments, type CompiledSchema } from "./schema.js";
 import { manualOf, toDescription, toListItem } from "./projection.js";
 import { createLogger, type LogEvent, type Logger } from "./log.js";
@@ -50,6 +56,21 @@ const PREFIXED_NAMES = OWNED_NAMES.map((name) => `${NAMESPACE}_${name}`) as read
 
 const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
+
+/**
+ * Upper bound on each dispose wait: in-flight calls, the registration disposal,
+ * the manual deregistration loop and the client close. None of them can be
+ * cancelled, so an unbounded wait would hang the host's plugin unload behind a
+ * transport or host hook that never answers. The bound applies per stage, so
+ * dispose can take up to the sum of the stages in the worst case.
+ */
+const DEFAULT_DISPOSE_DEADLINE_MS = 10_000;
+
+/**
+ * Sessions remembered by the policy-baseline probe. The probe runs once per
+ * session, so the memo would otherwise grow for the life of the process.
+ */
+const MAX_POLICY_SESSIONS = 1024;
 
 type LifecycleState = "initializing" | "ready" | "closing" | "closed";
 
@@ -126,6 +147,8 @@ export interface AdapterHooks {
    * exercise the fail-closed path deterministically.
    */
   installMcpProtocol?: () => NoRetryInstallation;
+  /** Bound on each dispose wait (in-flight calls, client close). Tests lower it. */
+  disposeDeadlineMs?: number;
 }
 
 interface CallContext {
@@ -155,6 +178,7 @@ export class UtcpAdapter {
   private registeredManuals: string[] = [];
   private effectiveNames: readonly string[] = [];
   private readonly inflight = new Set<Promise<unknown>>();
+  /** Insertion-ordered; the oldest session is evicted past MAX_POLICY_SESSIONS. */
   private readonly policyChecked = new Set<string>();
   private mcpRetrySuppressed = false;
   private initError: ErrorBody | null = null;
@@ -301,6 +325,16 @@ export class UtcpAdapter {
         continue;
       }
       candidates.push({ template: { ...template }, transport, name });
+    }
+
+    // Only streamable_http honours `timeout`. http and sse templates accept the
+    // key and then ignore it, so an operator who sets it gets no effect. Report
+    // it once per manual; the value itself is not logged.
+    for (const candidate of candidates) {
+      const type = normalizeCallTemplateType(candidate.template.call_template_type);
+      if ((type === "http" || type === "sse") && "timeout" in candidate.template) {
+        this.logger.emit({ event: "config", notice: "timeoutIgnored", manual: candidate.name, template: type });
+      }
     }
 
     // Step 4: explicit registration, every result inspected.
@@ -477,26 +511,63 @@ export class UtcpAdapter {
     this.logger.emit({ event: "lifecycle", phase: "closing" });
 
     // Calls already dispatched cannot be cancelled (the SDK takes no signal);
-    // account for them rather than claiming they stopped.
+    // account for them rather than claiming they stopped. The wait is bounded
+    // so a call that never answers cannot hang the unload; an abandoned call is
+    // reported as such and is not claimed to have stopped.
     if (this.inflight.size > 0) {
-      await Promise.allSettled([...this.inflight]);
-    }
-
-    try {
-      await this.registration?.dispose();
-    } catch {
-      // Registration disposal is best-effort; unloading the plugin also disposes it.
-    }
-    this.registration = null;
-
-    for (const name of this.registeredManuals) {
-      try {
-        await this.client?.deregisterManual(name);
-      } catch {
-        // Continue: `close()` below releases the client's owned protocols.
+      const settled = await withinDeadline(
+        Promise.allSettled([...this.inflight]),
+        this.disposeDeadlineMs(),
+      );
+      if (!settled) {
+        this.logger.emit({
+          event: "lifecycle",
+          phase: "closing",
+          detail: `inflightAbandoned:${this.inflight.size}`,
+        });
       }
     }
+
+    // Each stage below is bounded like the in-flight wait and the client close.
+    // A host teardown or a deregistration that never settles must not hold the
+    // unload. An expired stage is reported and not claimed to have stopped; the
+    // next stage still runs, so the client is still closed.
+    const registration = this.registration;
+    this.registration = null;
+    if (registration !== null) {
+      // The async wrapper turns a synchronous throw into a rejection, which
+      // withinDeadline then treats as settled. Registration disposal is
+      // best-effort; unloading the plugin also disposes it.
+      const disposed = await withinDeadline(
+        (async () => registration.dispose())(),
+        this.disposeDeadlineMs(),
+      );
+      if (!disposed) {
+        this.logger.emit({ event: "lifecycle", phase: "closing", detail: "registrationDisposeTimedOut" });
+      }
+    }
+
+    const manuals = this.registeredManuals;
     this.registeredManuals = [];
+    if (manuals.length > 0) {
+      // One deadline covers the whole loop. Each deregistration's failure is
+      // ignored; `close()` below releases the client's owned protocols.
+      const deregistered = await withinDeadline(
+        (async () => {
+          for (const name of manuals) {
+            try {
+              await this.client?.deregisterManual(name);
+            } catch {
+              // Continue with the next manual.
+            }
+          }
+        })(),
+        this.disposeDeadlineMs(),
+      );
+      if (!deregistered) {
+        this.logger.emit({ event: "lifecycle", phase: "closing", detail: "deregisterTimedOut" });
+      }
+    }
 
     await this.closeClient();
 
@@ -515,10 +586,19 @@ export class UtcpAdapter {
     this.client = null;
     if (client === null) return;
     try {
-      await client.close();
+      // Bounded: an MCP session whose cleanup never finishes must not keep the
+      // plugin loaded. The close is left running; it is not claimed to be done.
+      const closed = await withinDeadline(client.close(), this.disposeDeadlineMs());
+      if (!closed) {
+        this.logger.emit({ event: "lifecycle", phase: "closing", detail: "closeTimedOut" });
+      }
     } catch {
       // A failing close must not keep the plugin loaded.
     }
+  }
+
+  private disposeDeadlineMs(): number {
+    return this.hooks.disposeDeadlineMs ?? DEFAULT_DISPOSE_DEADLINE_MS;
   }
 
   /** Diagnostics for tests and operators; never contains credentials. */
@@ -639,6 +719,13 @@ export class UtcpAdapter {
     // Permission errors must propagate natively: they are not tool output.
     await this.assertPermission(prepared.entry, context);
 
+    // The permission prompt can outlast dispose(). The gate above is stale by
+    // now, and dispose's in-flight snapshot was taken before this call existed,
+    // so readiness is checked again here, with no await between this check and
+    // the dispatch in invoke(). A call admitted after closing starts is refused.
+    const stillReady = this.gate();
+    if (stillReady !== null) return stillReady;
+
     return this.invoke(prepared.entry, prepared.args, context);
   }
 
@@ -757,11 +844,27 @@ export class UtcpAdapter {
     const startedAt = Date.now();
     const name = entry.tool.name;
 
+    // A signal aborted before dispatch means the caller has already gone. The
+    // SDK call would still run, so refuse here. The call did not run, so this
+    // is not the "outcome unknown" case below.
+    if (context.signal?.aborted) {
+      this.logCall(entry, context, invocationID, Date.now() - startedAt, false, "INTERNAL_ERROR");
+      return failure({
+        code: "INTERNAL_ERROR",
+        message:
+          "The OC2 context aborted before dispatch, so the UTCP call was not sent and did not run.",
+        tool: name,
+      });
+    }
+
     if (typeof context.progress === "function") {
+      // Progress is advisory and is not awaited: a hook that never settles must
+      // not hold the call before dispatch, and nothing here can cancel it. It is
+      // still started before callTool, and its rejection is swallowed.
       try {
-        await context.progress({ status: "running", tool: name });
+        void Promise.resolve(context.progress({ status: "running", tool: name })).catch(() => undefined);
       } catch {
-        // Progress is advisory.
+        // A synchronous throw from the hook is advisory too.
       }
     }
 
@@ -862,6 +965,11 @@ export class UtcpAdapter {
     const sessionID = context.sessionID;
     if (this.policyChecked.has(sessionID)) return;
     this.policyChecked.add(sessionID);
+    if (this.policyChecked.size > MAX_POLICY_SESSIONS) {
+      // Set iteration is insertion order, so the first value is the oldest.
+      const oldest = this.policyChecked.values().next().value;
+      if (oldest !== undefined) this.policyChecked.delete(oldest);
+    }
 
     const probe = this.hooks.policyBaseline ?? defaultPolicyBaseline;
     let verdict: "rule" | "no-rule" | "unknown";
@@ -907,6 +1015,24 @@ function toCallContext(context: ToolExecuteContext): CallContext {
   };
 }
 
+/**
+ * Resolves `true` when `work` settles first and `false` when the deadline fires.
+ * The timer is cleared in every path, so a settled call leaves no timer behind
+ * to keep the process alive or fire later. A rejection counts as settled: the
+ * caller decides what a failure means.
+ */
+async function withinDeadline(work: Promise<unknown>, deadlineMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), deadlineMs);
+  });
+  try {
+    return await Promise.race([work.then(() => true, () => true), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function describeReceived(value: unknown): string {
   if (value === null) return "null";
   if (Array.isArray(value)) return "array";
@@ -929,8 +1055,10 @@ function manualNameFromTemplate(template: CallTemplate): string {
 
 /**
  * Reads the session directory's config for a `utcp` permission rule: the first
- * existing of `opencode.jsonc`, `opencode.json`, `config.json`, matched by a
- * textual `"action": "utcp"` search. Diagnostic only — it cannot see the global
+ * readable of `opencode.jsonc`, `opencode.json`, `config.json`. The file is
+ * parsed after comments are removed, and only an object in the top-level
+ * `permissions` array with `action: "utcp"` counts (the host ignores the
+ * singular `permission` key). Diagnostic only: it cannot see the global
  * config, saved approvals or the merged effective policy, and the adapter never
  * treats the absence of a rule as a decision.
  */
@@ -944,9 +1072,60 @@ export function defaultPolicyBaseline(directory: string | undefined): "rule" | "
     } catch {
       continue;
     }
-    return /"action"\s*:\s*"utcp"/.test(raw) ? "rule" : "no-rule";
+    // Trailing commas are JSONC-legal but JSON.parse rejects them, so such a
+    // file is reported as unparsable (unknown) rather than guessed at.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stripJsonComments(raw));
+    } catch {
+      return "unknown";
+    }
+    const permissions = isObject(parsed) ? parsed.permissions : undefined;
+    const hasRule =
+      Array.isArray(permissions) &&
+      permissions.some((entry) => isObject(entry) && entry.action === "utcp");
+    return hasRule ? "rule" : "no-rule";
   }
   return "unknown";
+}
+
+/**
+ * Removes `//` and `/* *\/` comments outside string literals. Hand-written so
+ * no dependency is needed. A comment becomes a space (or keeps its newline), so
+ * adjacent tokens stay separated. An unterminated string or comment is left in
+ * place for JSON.parse to reject.
+ */
+function stripJsonComments(text: string): string {
+  let out = "";
+  let index = 0;
+  while (index < text.length) {
+    const char = text[index]!;
+    if (char === '"') {
+      let end = index + 1;
+      while (end < text.length && text[end] !== '"') {
+        if (text[end] === "\\") end += 1;
+        end += 1;
+      }
+      out += text.slice(index, end + 1);
+      index = end + 1;
+    } else if (char === "/" && text[index + 1] === "/") {
+      while (index < text.length && text[index] !== "\n") index += 1;
+    } else if (char === "/" && text[index + 1] === "*") {
+      const close = text.indexOf("*/", index + 2);
+      if (close === -1) {
+        // Unterminated: keep the rest verbatim, so JSON.parse rejects it and the
+        // verdict is "unknown". Dropping it would read a broken file as valid.
+        out += text.slice(index);
+        break;
+      }
+      out += " ";
+      index = close + 2;
+    } else {
+      out += char;
+      index += 1;
+    }
+  }
+  return out;
 }
 
 /**
@@ -1008,6 +1187,12 @@ export function createUtcpPlugin(hooks: AdapterHooks = {}): Plugin.Plugin {
         if (ACTIVE === next) ACTIVE = null;
         adapter = null;
         throw error;
+      }
+      // `start()` returns normally after a config or registration failure and
+      // leaves the adapter `closed`. Release the claim here too, so that such a
+      // setup does not block every later plugin in this process.
+      if (next.status().state === "closed") {
+        if (ACTIVE === next) ACTIVE = null;
       }
       return async () => {
         await next.dispose();

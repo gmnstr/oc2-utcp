@@ -64,8 +64,11 @@ export interface ErrorBody {
   /** Present on TOOL_UNAVAILABLE; true only while startup is still running. */
   retryable?: boolean;
   /**
-   * Present when the adapter stopped awaiting a call it could not cancel.
-   * The remote side may still have executed it — never report "cancelled".
+   * Present on TIMEOUT, and when the adapter stopped awaiting a call it could
+   * not cancel (caller abort). The remote side may still have executed the
+   * call, so the adapter never reports it as cancelled or as not executed.
+   * A call aborted BEFORE dispatch carries no outcome: it was never sent, and
+   * its message says so.
    */
   outcome?: "unknown";
   /** All schema issues, bounded; first issue is repeated in path/keyword. */
@@ -210,6 +213,20 @@ function readString(value: unknown): string {
 }
 
 /**
+ * Every transport timeout. The timer that fired does not show whether the
+ * remote tool ran, so the outcome is always unknown, and the caller must not
+ * retry a call that may mutate state.
+ */
+function transportTimeout(tool: string | undefined): ErrorBody {
+  return {
+    code: "TIMEOUT",
+    message: `${toolLabel(tool)} timed out in the UTCP transport. The call may still have completed; check the remote side before retrying anything that mutates state.`,
+    tool,
+    outcome: "unknown",
+  };
+}
+
+/**
  * Classifies an arbitrary thrown value into the adapter vocabulary.
  *
  * The thrown value is inspected only. Its message is deliberately discarded:
@@ -240,11 +257,7 @@ export function classifyThrown(thrown: unknown, tool?: string): ErrorBody {
 
   // MCP's request timeout is a JSON-RPC code, not a Node error code.
   if (isMcp && numericCode === -32001) {
-    return {
-      code: "TIMEOUT",
-      message: `${toolLabel(tool)} timed out in the UTCP transport. The call may still have completed; check the remote side before retrying anything that mutates state.`,
-      tool,
-    };
+    return transportTimeout(tool);
   }
 
   // A streamable-HTTP timeout aborts the fetch and surfaces as a DOMException
@@ -255,27 +268,15 @@ export function classifyThrown(thrown: unknown, tool?: string): ErrorBody {
   // Caller aborts are handled in `invoke()`, which returns outcome-unknown
   // before `classifyThrown` is ever consulted.
   if (isAbort && ABORT_AS_TIMEOUT_PATTERN.test(prefix)) {
-    return {
-      code: "TIMEOUT",
-      message: `${toolLabel(tool)} timed out in the UTCP transport. The call may still have completed; check the remote side before retrying anything that mutates state.`,
-      tool,
-    };
+    return transportTimeout(tool);
   }
 
   // A transport timeout is reported only from a structural signal.
   if (TIMEOUT_CODES.has(code) || TIMEOUT_NAME_PATTERN.test(name)) {
-    return {
-      code: "TIMEOUT",
-      message: `${toolLabel(tool)} timed out in the UTCP transport. The call may still have completed; check the remote side before retrying anything that mutates state.`,
-      tool,
-    };
+    return transportTimeout(tool);
   }
   if (!isAbort && TIMEOUT_MESSAGE_PREFIX.test(prefix)) {
-    return {
-      code: "TIMEOUT",
-      message: `${toolLabel(tool)} timed out in the UTCP transport. The call may still have completed; check the remote side before retrying anything that mutates state.`,
-      tool,
-    };
+    return transportTimeout(tool);
   }
 
   // `@utcp/http` refuses a URL it considers unsafe before sending anything.
