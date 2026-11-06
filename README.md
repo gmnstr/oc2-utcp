@@ -67,9 +67,9 @@ Add one plugin entry to your project's `opencode.jsonc`:
 | Transport class | Default | Contents |
 | --- | --- | --- |
 | `http` | enabled | `http`, `sse`, `streamable_http` (the `streamable-http` spelling is accepted too) |
-| `mcp-http` | enabled | `mcp` manuals using HTTP/SSE servers |
+| `mcp-http` | enabled | `mcp` manuals whose server entries all use `transport: "http"`. `@utcp/mcp` accepts only `stdio` and `http` server entries, so there is no SSE server class. A server entry with any other transport makes the manual unclassified. |
 | `local-file` | disabled | `file`, `text` |
-| `mcp-stdio` | disabled | `mcp` manuals that spawn a child process |
+| `mcp-stdio` | disabled | `mcp` manuals with at least one `transport: "stdio"` server entry, which spawn a child process |
 | `cli` | disabled | `cli` |
 
 Disabled classes are refused before manuals are registered, so nothing is spawned, connected or opened for them. Invalid configuration fails closed: no tools are registered. The reason is reported in the adapter's `status()` diagnostics (`error.code` is `CONFIG_INVALID`) and in the lifecycle log line `[oc2-utcp] {"event":"lifecycle","phase":"closed","detail":"CONFIG_INVALID"}`. A manual whose `call_template_type` is missing or unknown is classified `unclassified` and dropped, while valid manuals keep working.
@@ -91,14 +91,16 @@ The three tools are Code Mode tools, reached from the host's `execute` surface:
 
 ```ts
 const { matches } = tools.utcp.search({ query: "issue", limit: 5 });
-// { matches: [{ name, description, manual, transport, tags }] }
+// { ok: true, matches: [{ name, description, manual, transport, tags }] }
 
 const { tool } = tools.utcp.describe({ name: "github.create_issue" });
-// { tool: { name, description, inputSchema, outputSchema, manual, transport, schemaSupported } }
+// { ok: true, tool: { name, description, manual, transport, tags, inputSchema, outputSchema, schemaSupported, schemaIssues? } }
 
 const result = tools.utcp.call({ name: "github.create_issue", arguments: { title: "Bug" } });
 // { ok: true, result } | { ok: false, error: { code, message, retryable, ... } }
 ```
+
+`schemaIssues` is present only when `schemaSupported` is `false`; each entry is `{ path, keyword, message? }`, where `path` is a dotted path such as `arguments.properties.filter.oneOf`.
 
 `search` and `describe` return projections only — no manual templates, headers or transport internals. `call` returns the remote result unchanged.
 
@@ -112,7 +114,7 @@ Read this section before enabling the plugin on a repository you do not control.
 2. **Registration itself can perform I/O.** Manifests are fetched when the plugin loads. With `mcp-http`, the plugin may connect to the configured server during initialization, before any tool call is approved. With `mcp-stdio`, registration can create a child process. Both classes are on or off per configuration — enable them only for servers you trust, and keep `mcp-stdio` off unless a manifest genuinely requires it.
 3. **The UTCP SDK logs on its own.** `@utcp/sdk` and `@utcp/http` write diagnostics to stdout and to stderr independently of this adapter, and they are not filtered here: they can include queries, resolved tool names, post-substitution URLs and failing request bodies. SDK lines therefore interleave with the adapter's `[oc2-utcp]` lines on stderr; the prefix identifies the adapter's own lines. Treat both streams as part of the trust boundary when you capture or forward logs.
 
-A recommended baseline is to require approval for the whole namespace and deny mutating tools by default. Enforcement uses the **`permissions`** array (plural); a rule written under `permission` is dropped by the host with a normalization diagnostic.
+A recommended baseline is to require approval for the whole namespace and deny mutating tools by default. The host reads the plural **`permissions`** array, and the adapter's own policy scan reads that array too. The adapter's scan ignores the singular `permission` key. How the host handles the singular key is not covered by a test in this repository, so do not rely on a rule written under it.
 
 ```jsonc
 {
@@ -125,7 +127,9 @@ A recommended baseline is to require approval for the whole namespace and deny m
 
 Only `call` asks for permission. `search` and `describe` do not: the names, short descriptions, tags and full input and output schemas of every tool that passes the configuration filters are visible to the model without approval.
 
-**Denying `execute` is not a kill switch.** On OpenCode 2.2.5, a host `execute` deny rule with resource `*` removes Code Mode, but the host then offers the three tools as direct tools named `utcp_search`, `utcp_describe` and `utcp_call` (see `test/host/permissions.test.ts`, "denying execute promotes the Code Mode tools to direct utcp_* tools"). Those tools still run the same code, and `call` still asks the `utcp` permission action. To disable UTCP calls, add a deny under `permissions`:
+**Denying `execute` is not a kill switch.** On OpenCode 2.2.5, a host `execute` deny rule with resource `*` removes Code Mode, but the host then offers the three tools as direct tools named `utcp_search`, `utcp_describe` and `utcp_call` (see `test/host/permissions.test.ts`, "denying execute promotes the Code Mode tools to direct utcp_* tools"). Those tools run the same code, so by code path `call` still asks the `utcp` permission action. No host test calls a promoted tool under an `execute` deny; that test checks only the tool names, so the permission behaviour of the promoted tools is not verified.
+
+The documented mechanism for an unbypassable operator limit is `policies`: they are evaluated after rules and saved approvals, turn `allow` or `ask` into `deny`, and never grant access (spec section 6.3). This repository does not test a `policies` configuration. The spec's example is `{ "action": "tool.use", "resource": "utcp:*", "effect": "deny" }`, which is not verified here. To disable UTCP calls through the `permissions` array, add a deny:
 
 ```jsonc
 {
@@ -135,16 +139,17 @@ Only `call` asks for permission. `search` and `describe` do not: the names, shor
 }
 ```
 
-This stops `call`, which is the only tool that reaches a transport. The host's enforcement of this deny was not tested. `search` and `describe` still return projections.
+This stops `call`, which is the only tool that reaches a transport. Host tests do enforce `utcp` deny rules on named resources: `test/host/permissions.test.ts` denies `demo.echo` and `demo.delete_item` and checks that each call is refused with no dispatch. Those suites skip without an OpenCode executable. A wildcard `*` deny of the `utcp` action is not tested. `search` and `describe` still return projections.
 
-The adapter logs `call`, `policy`, `manual` and `lifecycle` events as `[oc2-utcp] {...}` on stderr, including the tool name, manual, transport, duration, outcome and session identifiers — never argument values or headers.
+The adapter logs `call`, `policy`, `manual`, `lifecycle` and `config` events as `[oc2-utcp] {...}` on stderr, including the tool name, manual, transport, duration, outcome and session identifiers — never argument values or headers. The `config` event is `timeoutIgnored`, emitted once per `http` or `sse` manual that sets a `timeout`; the value is not logged.
 
 Please report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
 ## Compatibility
 
 - **OpenCode 2.2.5** is the supported host. The model-facing catalog shows the tools as `tools.utcp.search(...)`, `tools.utcp.describe(...)` and `tools.utcp.call(...)`; `ctx.tool.list()` inside the host reports the bare names `search`, `describe`, `call`.
-- **JSON Schema subset.** Supported: `type`, `properties`, `required`, `items`, `enum`, `const`, `additionalProperties`, `pattern`, numeric and length bounds, `default`, `title`, `description`, `examples`, `format`. Tools using `$ref`, composition (`oneOf`/`anyOf`/`allOf`/`not`), conditionals, `patternProperties`, `dependencies`, `contains`, `prefixItems`, `uniqueItems`, `multipleOf`, exclusive bounds or `unevaluated*` are still discoverable, but a call fails with `SCHEMA_UNSUPPORTED` rather than being validated loosely.
+- **Effective tool names differ from the spec.** Spec section 3.1 and the acceptance criterion in section 11 expect the effective names `utcp_search`, `utcp_describe` and `utcp_call`. This build does not produce them in the Code Mode catalog (they appear only when a host `execute` deny promotes the tools, as described under Security). The shipped `tools.utcp.search`, `tools.utcp.describe` and `tools.utcp.call` form is a deliberate, operator-approved exception. The measured reasons are recorded above the `transform` registration in `src/plugin.ts` (`UtcpAdapter.registerTools`) and in `test/host/probe-forms.ts`: a `utcp` namespace with bare names gives `tools.utcp.*`; a namespace with prefixed names gives `utcp_*` in `ctx.tool.list()` but doubles the prefix in the model catalog (`tools.utcp.utcp_search(...)`); no namespace with prefixed names gives `tools.utcp_search(...)`.
+- **JSON Schema subset (fail closed).** A keyword outside the supported set is rejected, not ignored. Supported: `type`, `properties`, `required`, `items` (single-schema form only), `enum`, `const`, `additionalProperties`, `pattern`, `minimum`, `maximum`, `minLength`, `maxLength`, `default`, `title`, `description`, `examples`, `format` (only formats Ajv knows), and `$schema`, which is accepted only as a draft-07 URI (`http://` or `https://` `json-schema.org/draft-07/schema`, with or without a trailing `#`). Rejected by name: `$ref`, `$defs`, `definitions`, `oneOf`, `anyOf`, `allOf`, `not`, `if`, `then`, `else`, `patternProperties`, `propertyNames`, `dependencies`, `dependentRequired`, `dependentSchemas`, `contains`, `minContains`, `maxContains`, `prefixItems`, `uniqueItems`, `multipleOf`, `exclusiveMinimum`, `exclusiveMaximum`, `unevaluatedProperties`, `unevaluatedItems`, and the tuple form of `items`. Also rejected, because they are outside the supported set: `minItems`, `maxItems`, `minProperties`, `maxProperties`, `$id`, and any other unlisted keyword. Tools using a rejected keyword are still discoverable and describable, but a call fails with `SCHEMA_UNSUPPORTED` rather than being validated loosely.
 - **Plain HTTP is refused except to a literal loopback host.** `@utcp/http` accepts `http://` only when the manual's URL names `localhost`, `127.0.0.1` or `::1` itself. Refused: plain HTTP to any other host; a loopback target that a remote manual or spec supplies as a tool or OAuth token URL; a loopback host that tool arguments steer the request to (arguments may change the path, not the host); and a redirect from a non-loopback origin into loopback. Use HTTPS for anything off-machine.
 - **MCP schemas are not dereferenced.** `$ref` in an MCP tool schema is preserved and reported as unsupported instead of being resolved, which avoids resolving local or remote references supplied by the server.
 - **Only `streamable_http` honours a manual-level `timeout`.** A hung plain-`http` server holds the invocation until the HTTP client's own default of 30 seconds elapses (not tested end to end). MCP servers have their own `timeout`, in seconds, default 30 (see Timeouts).
@@ -183,11 +188,11 @@ Layout: `src/` is the plugin (`plugin.ts`, `config.ts`, `schema.ts`, `errors.ts`
 
 - **One adapter per process.** A second instance is refused.
 - **Cancellation is not propagated.** The SDK call path accepts no abort signal, so a host abort stops the wait but cannot stop the remote call; the result is `INTERNAL_ERROR` with outcome `unknown`, never a clean "cancelled".
-- **Two behaviours depend on `@utcp/mcp` internals** — suppressing its built-in single retry of a failed call, and skipping `$ref` dereferencing. If those internals change, the affected manuals are refused at startup rather than degrading silently.
+- **Two behaviours depend on `@utcp/mcp` internals** — suppressing its built-in single retry of a failed call, and skipping `$ref` dereferencing. At startup the adapter checks only that the helper names it overrides exist and that the base `callTool` source mentions `_withSession` (`checkProtocolSurface` in `src/mcp-no-retry.ts`). If those checks fail, the MCP manuals are refused. A behavioural change that keeps the names is not detected at startup. It is caught only by `test/mcp-retry.test.ts` and by the scheduled `.github/workflows/sdk-drift.yml` workflow, which runs weekly against the latest `@utcp/*` packages.
 - **Effective policy cannot be read back from the host.** The adapter can only scan the project configuration text for a `utcp` rule, so a globally configured rule may be reported as unknown in its own diagnostics.
 - **SDK output is not captured per plugin.** Diagnostics from `@utcp/sdk` and `@utcp/http` reach the process stdout and stderr unfiltered, and SDK lines interleave with the adapter's `[oc2-utcp]` lines on stderr. The prefix identifies the adapter's own lines.
 - **Untrusted servers and manuals can exhaust memory.** The MCP SDK validates responses with zod, and the installed zod 3.25.76 has an unpatched high-severity advisory; a very large malformed array from a server can accumulate one issue object per element. `@utcp/sdk` also parses fetched manuals with zod 3 (`UtcpManualSchema`), so `http` manuals are parsed by the affected zod line too. Whether the advisory's pattern is reachable through that path was not assessed. Keep `mcp-http` enabled only for trusted servers, and point `http` manuals only at endpoints you trust. See [SECURITY.md](SECURITY.md#known-dependency-advisories).
-- **Unload waits are bounded.** On unload the adapter waits at most about 10 seconds for in-flight calls and then at most about 10 seconds for client close. It then logs a `lifecycle` line with `detail` `inflightAbandoned:<n>` or `closeTimedOut` and proceeds. Abandoned calls are not stopped, and their remote effect is unknown.
+- **Unload waits are bounded.** Each dispose stage waits at most about 10 seconds: in-flight calls, registration disposal, manual deregistration and client close. When a stage expires, the adapter logs a `lifecycle` line whose `detail` is `inflightAbandoned:<n>`, `registrationDisposeTimedOut`, `deregisterTimedOut` or `closeTimedOut`, and continues. Abandoned in-flight calls are not stopped, because the SDK takes no cancellation signal; their remote effect is unknown. A call that is waiting on a permission prompt when the adapter is closing refuses to dispatch and returns `TOOL_UNAVAILABLE`.
 - **No live refresh.** Manuals are resolved at startup; changing them means reloading the host.
 
 ## Verified host and SDK behaviour
@@ -196,17 +201,17 @@ Answers to the open verification items. "Verified" means the code or test named 
 
 | Item | Answer | Evidence | Status |
 | --- | --- | --- | --- |
-| 14.1 Multi-resource saved approvals | Not tested. The adapter asserts one resource per call (the tool name) and asks to save it only when the name matches `^[A-Za-z0-9_.\-]+$`. | `src/plugin.ts:735-745` | Not verified |
-| 14.2 Effective policy resolution | No API found that returns the merged rule set. The host exposes `ctx.permission.hook("evaluate", ...)`, `list` and `get`, none evaluated here. The adapter only scans project config text for a `utcp` rule. | `node_modules/@opencode/plugin/dist/promise/permission.d.ts:20-21`; `src/plugin.ts:861-876` | Not verified |
-| 14.3 Code Mode reachability | Denying `execute` removes Code Mode and exposes `utcp_search`, `utcp_describe` and `utcp_call` as direct tools. See Security. | `test/host/permissions.test.ts:227-268` (host test; read, not executed) | Verified |
-| 14.4 Registration-time MCP behaviour | Stdio children are spawned during `start()` and terminated on dispose. `mcp` manuals list tools through a session at registration, which connects to the server. `http` manifests are fetched at registration. | `test/gaps.test.ts:217-247`; `node_modules/@utcp/mcp/dist/index.js:4579-4603`; `node_modules/@utcp/http/dist/index.js:5294-5328` | Verified |
-| 14.5 `RegisterManualResult` semantics | Each manual's result is inspected once. A failed manual is recorded as `registered: false` with a fixed reason, is not retried, and does not stop the other manuals from registering. | `src/plugin.ts:307-335` | Verified |
-| 14.6 `callToolStreaming` abort | Not verified. Not used: the adapter calls `callTool`, which takes no abort signal. | `node_modules/@utcp/sdk/dist/index.js:1563`; `src/plugin.ts:768-770` | Not verified |
+| 14.1 Multi-resource saved approvals | Not tested. The adapter asserts one resource per call (the tool name) and asks to save it only when the name matches `^[A-Za-z0-9_.\-]+$`. | `UtcpAdapter.assertPermission` in `src/plugin.ts` | Not verified |
+| 14.2 Effective policy resolution | No API found that returns the merged rule set. The host exposes `ctx.permission.hook("evaluate", ...)`, `list` and `get`, none evaluated here. The adapter only scans project config text for a `utcp` rule. | `node_modules/@opencode/plugin/dist/promise/permission.d.ts:20-21`; `defaultPolicyBaseline` and `UtcpAdapter.notePolicyBaseline` in `src/plugin.ts` | Not verified |
+| 14.3 Code Mode reachability | Denying `execute` removes Code Mode and exposes `utcp_search`, `utcp_describe` and `utcp_call` as direct tools. See Security. | `test/host/permissions.test.ts`, "denying execute promotes the Code Mode tools to direct utcp_* tools" (lines 227-268; read, not executed) | Verified |
+| 14.4 Registration-time MCP behaviour | Stdio children are spawned during `start()` and terminated on dispose. `mcp` manuals list tools through a session at registration, which connects to the server. `http` manifests are fetched at registration. | `test/gaps.test.ts`, "an enabled mcp-stdio manual spawns one child and terminates it on dispose" (lines 219-247); `node_modules/@utcp/mcp/dist/index.js:4579-4603`; `node_modules/@utcp/http/dist/index.js:5294-5328` | Verified |
+| 14.5 `RegisterManualResult` semantics | Each manual's result is inspected once. A failed manual is recorded as `registered: false` with a fixed reason, is not retried, and does not stop the other manuals from registering. | `UtcpAdapter.initialize` in `src/plugin.ts` (the manual result loop) | Verified |
+| 14.6 `callToolStreaming` abort | Not verified. Not used: the adapter calls `callTool`, which takes no abort signal. | `node_modules/@utcp/sdk/dist/index.js:1563` (`callTool`) and `:1599` (`callToolStreaming`); `UtcpAdapter.invoke` in `src/plugin.ts` | Not verified |
 | 14.7 SDK stdout, channels | `@utcp/sdk` and `@utcp/http` write to stdout and to stderr. | `node_modules/@utcp/sdk/dist/index.js:1504-1688`; `node_modules/@utcp/http/dist/index.js:5281-5284` | Verified |
 | 14.7 SDK stdout, host capture | Whether OpenCode captures or forwards either stream was not tested. | none | Not verified |
-| 14.8 Setup replay in one process | A second `setup` in the same process is refused with `CONFIG_INVALID`. | `test/gaps.test.ts:313-331`; `src/plugin.ts:996-998` | Verified |
+| 14.8 Setup replay in one process | A second `setup` in the same process is refused with `CONFIG_INVALID`. | `test/gaps.test.ts`, "a second setup fails with CONFIG_INVALID and a clear message" and "the same plugin object cannot be set up twice" (the latter exercises the re-check in `createUtcpPlugin`'s `setup`) | Verified |
 | 14.8 Setup replay on host reload | Not tested. | none | Not verified |
-| 14.9 `text` transport, classification | `text` is classified as `local-file` and that class is disabled by default. | `src/transport.ts:31`, `:67-68` | Verified |
+| 14.9 `text` transport, classification | `text` is classified as `local-file` and that class is disabled by default. | `src/transport.ts`: `classForType` (the `text` case) and `DEFAULT_TRANSPORTS` (`local-file: false`) | Verified |
 | 14.9 `text` transport, registration | Whether `@utcp/text` reads files at registration was not tested. | none | Not verified |
-| 14.10 Per-plugin stdout capture | Not verified. The adapter neither captures nor redirects SDK stdout. | `src/log.ts:57-64` | Not verified |
+| 14.10 Per-plugin stdout capture | Not verified. The adapter neither captures nor redirects SDK stdout. | `defaultSink` in `src/log.ts` (writes only to `console.error`) | Not verified |
 | 14.11 Shared repository mutation | Not verified. | none | Not verified |

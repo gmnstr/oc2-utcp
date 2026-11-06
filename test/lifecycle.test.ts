@@ -331,3 +331,138 @@ describe("unnamed manuals (investigation)", () => {
     expect(serverB.hits("beta")).toBe(1);
   }, 20_000);
 });
+
+describe("dispose during a pending permission prompt (W7-1)", () => {
+  test("a call still awaiting permission when dispose starts is refused and never dispatched", async () => {
+    const server = fixture();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const host = makeFakeHost({ manuals: [httpManual("demo", server)] }, { onAssert: () => gate });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined, policyBaseline: () => "rule" });
+    await adapter.start();
+
+    const pending = host.runJson("call", { name: "demo.echo", arguments: {} });
+    await waitFor(() => host.asserts.length === 1, 5_000);
+
+    const disposing = adapter.dispose();
+    release();
+    const result = await pending;
+    await disposing;
+
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe("TOOL_UNAVAILABLE");
+    expect(result.error.retryable).toBe(false);
+    expect(server.hits("echo")).toBe(0);
+  }, 20_000);
+});
+
+describe("bounded deregistration (W7-2)", () => {
+  test("dispose does not wait forever for a manual deregistration that never settles", async () => {
+    const server = fixture();
+    const host = makeFakeHost({ manuals: [httpManual("demo", server)] });
+    const events: LogEvent[] = [];
+    const adapter = new UtcpAdapter(host.ctx, {
+      log: (event) => events.push(event),
+      policyBaseline: () => "rule",
+      disposeDeadlineMs: 200,
+    });
+    await adapter.start();
+
+    const client = (adapter as unknown as { client: { deregisterManual: (n: string) => Promise<unknown> } }).client;
+    client.deregisterManual = () => new Promise<void>(() => {});
+
+    const startedAt = Date.now();
+    await adapter.dispose();
+    const elapsed = Date.now() - startedAt;
+
+    expect(elapsed).toBeLessThan(3_000);
+    expect(adapter.status().state).toBe("closed");
+    expect(
+      events.some((event) => event.event === "lifecycle" && event.phase === "closing" && event.detail === "deregisterTimedOut"),
+    ).toBe(true);
+  }, 20_000);
+
+  test("dispose does not wait forever for a registration disposal that never settles", async () => {
+    const server = fixture();
+    const host = makeFakeHost({ manuals: [httpManual("demo", server)] });
+    const events: LogEvent[] = [];
+    const adapter = new UtcpAdapter(host.ctx, {
+      log: (event) => events.push(event),
+      policyBaseline: () => "rule",
+      disposeDeadlineMs: 200,
+    });
+    await adapter.start();
+
+    (adapter as unknown as { registration: { dispose: () => Promise<void> } }).registration = {
+      dispose: () => new Promise<void>(() => {}),
+    };
+
+    const startedAt = Date.now();
+    await adapter.dispose();
+    const elapsed = Date.now() - startedAt;
+
+    expect(elapsed).toBeLessThan(3_000);
+    expect(adapter.status().state).toBe("closed");
+    expect(
+      events.some(
+        (event) =>
+          event.event === "lifecycle" && event.phase === "closing" && event.detail === "registrationDisposeTimedOut",
+      ),
+    ).toBe(true);
+  }, 20_000);
+});
+
+describe("unterminated block comment in the policy file (W7-4)", () => {
+  test("an unterminated block comment leaves the file unparsable, so the verdict is unknown", () => {
+    const dir = mkdtempSync(join(tmpdir(), "oc2-utcp-policy-"));
+    writeFileSync(join(dir, "opencode.json"), `{"permissions":[]} /* unterminated`);
+    expect(defaultPolicyBaseline(dir)).toBe("unknown");
+  });
+});
+
+describe("advisory progress hook (W7-5)", () => {
+  test("a progress hook that never settles does not block the call", async () => {
+    const server = fixture();
+    const host = makeFakeHost({ manuals: [httpManual("demo", server)] });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined, policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    let progressCalled = false;
+    const call = host.runJson(
+      "call",
+      { name: "demo.echo", arguments: {} },
+      {
+        progress: () => {
+          progressCalled = true;
+          return new Promise<void>(() => {});
+        },
+      },
+    );
+    const outcome = await Promise.race([call, Bun.sleep(5_000).then(() => "hung" as const)]);
+
+    expect(progressCalled).toBe(true);
+    expect(outcome).not.toBe("hung");
+    expect((outcome as { ok: boolean }).ok).toBe(true);
+    expect(server.hits("echo")).toBe(1);
+  }, 20_000);
+
+  test("a progress hook that rejects does not fail the call", async () => {
+    const server = fixture();
+    const host = makeFakeHost({ manuals: [httpManual("demo", server)] });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined, policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    const result = await host.runJson(
+      "call",
+      { name: "demo.echo", arguments: {} },
+      { progress: () => Promise.reject(new Error("progress sink failed")) },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(server.hits("echo")).toBe(1);
+  }, 20_000);
+});

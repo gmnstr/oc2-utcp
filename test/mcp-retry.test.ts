@@ -153,6 +153,70 @@ describe("MCP mutating-call replay", () => {
   });
 });
 
+describe("session cleanup is scoped to the session that failed (W7-3)", () => {
+  /** Structural view of the installed protocol's session helpers. */
+  interface SessionHelpers {
+    _getOrCreateSession: (...args: unknown[]) => Promise<unknown>;
+    _cleanupSession: (...args: unknown[]) => Promise<void>;
+    _withSession: (...args: unknown[]) => Promise<unknown>;
+  }
+
+  function installedProtocol(): SessionHelpers {
+    expect(installNoRetryMcpProtocol()).toBe("installed");
+    const factory = CommunicationProtocol.communicationProtocolFactories["mcp"];
+    expect(typeof factory).toBe("function");
+    return factory!() as unknown as SessionHelpers;
+  }
+
+  test("a failed session creation does not evict the cached session", async () => {
+    const protocol = installedProtocol();
+    const cleanups: unknown[][] = [];
+    protocol._getOrCreateSession = async () => {
+      throw new Error("connection closed before the session was created");
+    };
+    protocol._cleanupSession = async (...args: unknown[]) => {
+      cleanups.push(args);
+    };
+
+    let error: unknown;
+    try {
+      await protocol._withSession("flaky", { url: "http://127.0.0.1:1" }, undefined, async () => "unused");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    // With no client, `_cleanupSession` would fall back to the cached session
+    // for this key, which may be a healthy concurrent one. It must not run.
+    expect(cleanups).toEqual([]);
+    uninstallNoRetryMcpProtocol();
+  });
+
+  test("a failed operation evicts exactly the session it used", async () => {
+    const protocol = installedProtocol();
+    const fakeClient = { id: "client-under-test" };
+    const cleanups: unknown[][] = [];
+    protocol._getOrCreateSession = async () => fakeClient;
+    protocol._cleanupSession = async (...args: unknown[]) => {
+      cleanups.push(args);
+    };
+
+    let error: unknown;
+    try {
+      await protocol._withSession("flaky", { url: "http://127.0.0.1:1" }, undefined, async () => {
+        throw new Error("connection closed mid-call");
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect(cleanups).toHaveLength(1);
+    expect(cleanups[0]![1]).toBe(fakeClient);
+    uninstallNoRetryMcpProtocol();
+  });
+});
+
 describe("protocol surface check", () => {
   test("a complete surface whose callTool routes through _withSession is supported", () => {
     expect(checkProtocolSurface(fakePrototype())).toBe("supported");

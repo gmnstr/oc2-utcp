@@ -58,9 +58,11 @@ const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
 
 /**
- * Upper bound on how long dispose waits for in-flight calls and for the client
- * to close. Neither can be cancelled, so an unbounded wait would hang the host's
- * plugin unload behind a transport that never answers.
+ * Upper bound on each dispose wait: in-flight calls, the registration disposal,
+ * the manual deregistration loop and the client close. None of them can be
+ * cancelled, so an unbounded wait would hang the host's plugin unload behind a
+ * transport or host hook that never answers. The bound applies per stage, so
+ * dispose can take up to the sum of the stages in the worst case.
  */
 const DEFAULT_DISPOSE_DEADLINE_MS = 10_000;
 
@@ -526,21 +528,46 @@ export class UtcpAdapter {
       }
     }
 
-    try {
-      await this.registration?.dispose();
-    } catch {
-      // Registration disposal is best-effort; unloading the plugin also disposes it.
-    }
+    // Each stage below is bounded like the in-flight wait and the client close.
+    // A host teardown or a deregistration that never settles must not hold the
+    // unload. An expired stage is reported and not claimed to have stopped; the
+    // next stage still runs, so the client is still closed.
+    const registration = this.registration;
     this.registration = null;
-
-    for (const name of this.registeredManuals) {
-      try {
-        await this.client?.deregisterManual(name);
-      } catch {
-        // Continue: `close()` below releases the client's owned protocols.
+    if (registration !== null) {
+      // The async wrapper turns a synchronous throw into a rejection, which
+      // withinDeadline then treats as settled. Registration disposal is
+      // best-effort; unloading the plugin also disposes it.
+      const disposed = await withinDeadline(
+        (async () => registration.dispose())(),
+        this.disposeDeadlineMs(),
+      );
+      if (!disposed) {
+        this.logger.emit({ event: "lifecycle", phase: "closing", detail: "registrationDisposeTimedOut" });
       }
     }
+
+    const manuals = this.registeredManuals;
     this.registeredManuals = [];
+    if (manuals.length > 0) {
+      // One deadline covers the whole loop. Each deregistration's failure is
+      // ignored; `close()` below releases the client's owned protocols.
+      const deregistered = await withinDeadline(
+        (async () => {
+          for (const name of manuals) {
+            try {
+              await this.client?.deregisterManual(name);
+            } catch {
+              // Continue with the next manual.
+            }
+          }
+        })(),
+        this.disposeDeadlineMs(),
+      );
+      if (!deregistered) {
+        this.logger.emit({ event: "lifecycle", phase: "closing", detail: "deregisterTimedOut" });
+      }
+    }
 
     await this.closeClient();
 
@@ -692,6 +719,13 @@ export class UtcpAdapter {
     // Permission errors must propagate natively: they are not tool output.
     await this.assertPermission(prepared.entry, context);
 
+    // The permission prompt can outlast dispose(). The gate above is stale by
+    // now, and dispose's in-flight snapshot was taken before this call existed,
+    // so readiness is checked again here, with no await between this check and
+    // the dispatch in invoke(). A call admitted after closing starts is refused.
+    const stillReady = this.gate();
+    if (stillReady !== null) return stillReady;
+
     return this.invoke(prepared.entry, prepared.args, context);
   }
 
@@ -824,10 +858,13 @@ export class UtcpAdapter {
     }
 
     if (typeof context.progress === "function") {
+      // Progress is advisory and is not awaited: a hook that never settles must
+      // not hold the call before dispatch, and nothing here can cancel it. It is
+      // still started before callTool, and its rejection is swallowed.
       try {
-        await context.progress({ status: "running", tool: name });
+        void Promise.resolve(context.progress({ status: "running", tool: name })).catch(() => undefined);
       } catch {
-        // Progress is advisory.
+        // A synchronous throw from the hook is advisory too.
       }
     }
 
@@ -1075,8 +1112,14 @@ function stripJsonComments(text: string): string {
       while (index < text.length && text[index] !== "\n") index += 1;
     } else if (char === "/" && text[index + 1] === "*") {
       const close = text.indexOf("*/", index + 2);
+      if (close === -1) {
+        // Unterminated: keep the rest verbatim, so JSON.parse rejects it and the
+        // verdict is "unknown". Dropping it would read a broken file as valid.
+        out += text.slice(index);
+        break;
+      }
       out += " ";
-      index = close === -1 ? text.length : close + 2;
+      index = close + 2;
     } else {
       out += char;
       index += 1;

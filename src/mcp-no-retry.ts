@@ -213,7 +213,14 @@ export function installNoRetryMcpProtocol(): NoRetryInstallation {
         // evict it so a later call dials fresh. The base implementation does
         // the same before its retry; here there is no retry, only the eviction.
         if (classification !== null) {
-          await helpers._cleanupSession(sessionKey, client).catch(() => undefined);
+          // Only a session this call actually created or used is evicted. When
+          // creation itself failed there is no client, and `_cleanupSession`
+          // with an undefined client falls back to the cached session for this
+          // key, which may be a healthy concurrent one. The base class guards
+          // the same way.
+          if (client !== undefined) {
+            await helpers._cleanupSession(sessionKey, client).catch(() => undefined);
+          }
           if (classification === "auth") helpers._invalidateOAuthToken(auth);
         }
         throw error;
