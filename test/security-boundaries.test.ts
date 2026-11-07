@@ -3,14 +3,14 @@ import { UtcpAdapter, MAX_INFLIGHT_GLOBAL, MAX_INFLIGHT_PER_MANUAL } from "../sr
 import { MAX_ARG_BYTES, refuseArgumentShape } from "../src/schema.js";
 import { boundedJsonStringify, MAX_MODEL_OUTPUT_BYTES } from "../src/output.js";
 import { makeFakeHost, type FakeHost } from "./helpers/host.js";
-import { startUtcpFixture, httpManual, type UtcpFixtureServer } from "./fixtures/utcp-http-server.js";
+import { startUtcpFixture, httpManual, type FixtureTool, type UtcpFixtureServer } from "./fixtures/utcp-http-server.js";
 
 const cleanup: Array<() => Promise<void> | void> = [];
 afterEach(async () => {
   while (cleanup.length) await cleanup.pop()?.();
 });
 
-function fixture(tools: Parameters<typeof startUtcpFixture>[0]["tools"]): UtcpFixtureServer {
+function fixture(tools: FixtureTool[]): UtcpFixtureServer {
   const server = startUtcpFixture({ tools });
   cleanup.push(() => server.stop());
   return server;
