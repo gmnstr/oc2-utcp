@@ -8,7 +8,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 
-import { MAX_ABANDONED_PER_MANUAL, MAX_OUTSTANDING_PER_MANUAL, UtcpAdapter } from "../src/plugin.js";
+import { MAX_ABANDONED_PER_MANUAL, MAX_OUTSTANDING_PER_MANUAL, MAX_INFLIGHT_PER_MANUAL, UtcpAdapter } from "../src/plugin.js";
 import type { LogEvent } from "../src/log.js";
 import { makeFakeHost, type FakeHost } from "./helpers/host.js";
 import { startUtcpFixture, type FixtureTool, type UtcpFixtureServer } from "./fixtures/utcp-http-server.js";
@@ -466,4 +466,43 @@ describe("dispose creates no abandon-hold timer (D2 2)", () => {
     expect(internals(adapter).abandonedByManual.get("demo")).toBe(1);
     expect(internals(adapter).abandonHoldTimers.size).toBe(0);
   }, 20_000);
+});
+
+describe("hard in-flight limit survives abandoned-hold expiry", () => {
+  test("a waitMs hold timer cannot release capacity while the underlying call is pending", async () => {
+    const server = fixture([{ name: "hang", hold: true }]);
+    const { host, adapter } = await start(
+      { manuals: [httpManual("demo", server, { waitMs: 1000 })] },
+      500,
+      { abandonHoldMs: 150 },
+    );
+
+    const timedOut = await Promise.all(
+      Array.from({ length: MAX_INFLIGHT_PER_MANUAL }, () =>
+        host.runJson("call", { name: "demo.hang", arguments: {} }),
+      ),
+    );
+    for (const result of timedOut) {
+      expect(result.error.code).toBe("TIMEOUT");
+      expect(result.error.outcome).toBe("unknown");
+    }
+    await waitFor(() => server.hits("hang") === MAX_INFLIGHT_PER_MANUAL, 10_000);
+    await Bun.sleep(250);
+
+    // Old waitMs accounting deliberately releases its five-minute hold;
+    // the new hard count still holds one slot per unsettled SDK promise.
+    expect(internals(adapter).outstandingByManual.get("demo")).toBeUndefined();
+    expect(internals(adapter).inflight.size).toBe(MAX_INFLIGHT_PER_MANUAL);
+    const refused = await host.runJson("call", { name: "demo.hang", arguments: {} });
+    expect(refused.error.code).toBe("TOOL_UNAVAILABLE");
+    expect(refused.error.outcome).toBeUndefined();
+    expect(server.hits("hang")).toBe(MAX_INFLIGHT_PER_MANUAL);
+
+    while (server.releaseOne()) {}
+    await waitFor(() => internals(adapter).inflight.size === 0, 10_000);
+    const afterSettlement = host.runJson("call", { name: "demo.hang", arguments: {} });
+    await waitFor(() => server.hits("hang") === MAX_INFLIGHT_PER_MANUAL + 1, 10_000);
+    expect(server.releaseOne()).toBe(true);
+    expect((await afterSettlement).ok).toBe(true);
+  }, 30_000);
 });

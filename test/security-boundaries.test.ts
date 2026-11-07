@@ -147,11 +147,11 @@ describe("registration and execution outcome boundaries", () => {
   }, 30_000);
 
   test("a transport error after dispatch reports unknown outcome without retry", async () => {
-    const server = fixture([{ name: "commit_then_error", status: 500 }]);
+    const server = fixture([{ name: "error_after_dispatch", status: 500 }]);
     const host = await start([httpManual("demo", server)]);
-    const result = await host.runJson("call", { name: "demo.commit_then_error", arguments: {} });
+    const result = await host.runJson("call", { name: "demo.error_after_dispatch", arguments: {} });
     expect(result).toMatchObject({ ok: false, error: { code: "TRANSPORT_ERROR", outcome: "unknown" } });
     expect(result.error.message).toContain("check remote state");
-    expect(server.hits("commit_then_error")).toBe(1);
+    expect(server.hits("error_after_dispatch")).toBe(1);
   });
 });
