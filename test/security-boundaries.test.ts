@@ -45,7 +45,9 @@ describe("pre-dispatch argument budget", () => {
     }]);
     const host = await start([httpManual("demo", server)]);
     const payload = "x".repeat(MAX_ARG_BYTES + 1);
-    expect(refuseArgumentShape({ payload })?.received).toBe("too many bytes");
+    const refused = refuseArgumentShape({ payload });
+    expect(refused?.ok).toBe(false);
+    if (refused?.ok === false) expect(refused.received).toBe("too many bytes");
     const result = await host.runJson("call", { name: "demo.echo", arguments: { payload } });
     expect(result.error.code).toBe("VALIDATION_FAILED");
     expect(result.error.received).toBe("too many bytes");
@@ -54,7 +56,9 @@ describe("pre-dispatch argument budget", () => {
   });
   test("counts large object keys as bytes", () => {
     const hugeKey = "k".repeat(MAX_ARG_BYTES + 1);
-    expect(refuseArgumentShape({ [hugeKey]: 1 })?.received).toBe("too many bytes");
+    const refused = refuseArgumentShape({ [hugeKey]: 1 });
+    expect(refused?.ok).toBe(false);
+    if (refused?.ok === false) expect(refused.received).toBe("too many bytes");
   });
 });
 
