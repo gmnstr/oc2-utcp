@@ -29,6 +29,7 @@ import Ajv, { type ErrorObject, type ValidateFunction } from "ajv";
 import addFormats from "ajv-formats";
 import type { JsonSchema } from "@utcp/sdk";
 import { displayText, type SchemaIssue } from "./errors.js";
+import { createLogger } from "./log.js";
 
 /**
  * Schema objects the walk may visit before the schema is refused as too large.
@@ -828,9 +829,24 @@ export function validateArguments(validate: ValidateFunction, args: unknown): Ar
  */
 function refuseBeforeValidation(args: unknown, bound: number): ArgumentValidation | undefined {
   const measured = measureArguments(args);
+  const shape = shapeRefusal(measured);
+  if (shape !== undefined) return shape;
+  if (bound * measured.nodes > MAX_EVAL_WORK) return ARGUMENTS_TOO_LARGE;
+  return undefined;
+}
+
+/**
+ * The depth and value-count refusals alone, measured on the value as given. The
+ * adapter runs this on the caller's arguments before any copy, so an adversarial
+ * shape never reaches structuredClone. Undefined when both limits hold.
+ */
+export function refuseArgumentShape(args: unknown): ArgumentValidation | undefined {
+  return shapeRefusal(measureArguments(args));
+}
+
+function shapeRefusal(measured: ArgumentMeasure): ArgumentValidation | undefined {
   if (measured.shape === "deep") return ARGUMENTS_TOO_DEEP;
   if (measured.shape === "many") return ARGUMENTS_TOO_MANY;
-  if (bound * measured.nodes > MAX_EVAL_WORK) return ARGUMENTS_TOO_LARGE;
   return undefined;
 }
 
@@ -879,11 +895,17 @@ function describeFailure(errors: readonly ErrorObject[] | null | undefined, args
 export const PATTERN_DEADLINE_MS = 2_000;
 /** Pattern-validation workers allowed at once. A call over this is refused, not queued. */
 export const MAX_PATTERN_WORKERS = 8;
+/**
+ * After a worker is terminated, how long it may keep its cap slot while it has not
+ * reported its exit. Past this it is released anyway, and a `patternWorkerStuck` line is logged.
+ */
+const TERMINATE_GRACE_MS = 10_000;
+const workerLog = createLogger();
 
-/** Workers currently running a pattern validation, each with the function that stops it. */
+/** Workers not yet reaped, each with the function that stops it: still running, or terminated and not yet reported as exited. */
 const livePatternWorkers = new Map<Worker, () => void>();
 
-/** Live pattern-validation workers, for tests and diagnostics. */
+/** Pattern-validation workers not yet reaped (see runPatternWorker), for tests and diagnostics. */
 export function livePatternWorkerCount(): number {
   return livePatternWorkers.size;
 }
@@ -918,6 +940,10 @@ type WorkerOutcome =
   | { kind: "stopped" }
   | { kind: "unavailable" };
 
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return typeof value === "object" && value !== null && typeof (value as { then?: unknown }).then === "function";
+}
+
 function readReply(data: unknown): WorkerOutcome {
   if (!isRecord(data) || data["crashed"] === true) return { kind: "unavailable" };
   const valid = data["valid"];
@@ -929,8 +955,8 @@ function readReply(data: unknown): WorkerOutcome {
 /**
  * Runs one validation in a fresh worker and resolves once, whatever happens: a
  * reply, the deadline, a stop, or a worker that cannot be created or errors. The
- * worker is terminated on every path, and it is registered in livePatternWorkers
- * until then.
+ * worker is terminated on every path, and it stays registered in livePatternWorkers
+ * until it is reaped (see stopThread).
  */
 function runPatternWorker(schema: unknown, args: unknown, deadlineMs: number): Promise<WorkerOutcome> {
   return new Promise<WorkerOutcome>((resolve) => {
@@ -945,20 +971,41 @@ function runPatternWorker(schema: unknown, args: unknown, deadlineMs: number): P
 
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // The worker keeps its cap slot until it is reaped: on its exit (close event),
+    // when terminate() returns a promise that resolves, or when the grace period ends.
+    let reaped = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const reap = (): void => {
+      if (reaped) return;
+      reaped = true;
+      clearTimeout(graceTimer);
+      livePatternWorkers.delete(worker);
+    };
+    const stopThread = (): void => {
+      let stopping: unknown;
+      try {
+        stopping = worker.terminate();
+      } catch {
+        // Not confirmed stopped; the grace period below releases the slot.
+      }
+      if (isPromiseLike(stopping)) stopping.then(reap, reap);
+      if (reaped) return;
+      graceTimer = setTimeout(() => {
+        if (reaped) return;
+        workerLog.emit({ event: "config", notice: "patternWorkerStuck" });
+        reap();
+      }, TERMINATE_GRACE_MS);
+    };
     const finish = (outcome: WorkerOutcome): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      livePatternWorkers.delete(worker);
-      try {
-        worker.terminate();
-      } catch {
-        // Already gone; the outcome is what matters.
-      }
+      stopThread();
       resolve(outcome);
     };
 
     livePatternWorkers.set(worker, () => finish({ kind: "stopped" }));
+    worker.addEventListener("close", reap);
     timer = setTimeout(() => finish({ kind: "timeout" }), deadlineMs);
     worker.onmessage = (event: MessageEvent) => finish(readReply(event.data));
     worker.onerror = () => finish({ kind: "unavailable" });
@@ -1018,7 +1065,8 @@ export async function validateArgumentsGuarded(
         path: "arguments",
         expected: "validation within the time limit",
         received: "validation timed out",
-        message: "validation of the arguments exceeded the time limit.",
+        message:
+          "validation of the arguments exceeded the time limit. The pattern may be hostile, or the host may have been too slow to start the validation worker; retry, and simplify the pattern if it keeps failing.",
       };
     case "stopped":
       return {

@@ -113,6 +113,8 @@ export function loadConfig(rawOptions: unknown, locationDirectory: string | unde
       }
       seenNames.add(sanitized);
     }
+    const spellingError = checkWaitKeySpelling(candidate, index);
+    if (spellingError !== null) return configInvalid(spellingError);
     if (candidate.waitMs !== undefined) {
       const waitError = checkWaitMs(candidate, index);
       if (waitError !== null) return configInvalid(waitError);
@@ -159,6 +161,29 @@ export function loadConfig(rawOptions: unknown, locationDirectory: string | unde
   return { ok: true, config: { rootDir, manuals, transports, toolPatterns } };
 }
 
+/** How a manual is named in a configuration message: its sanitized name, or its position when unnamed. */
+function manualLabel(candidate: Record<string, unknown>, index: number): string {
+  const rawName = typeof candidate.name === "string" ? candidate.name.trim() : "";
+  return rawName.length > 0 ? `manual '${displayText(rawName.replace(/[^\w]/g, "_"), 80)}'` : `manuals[${index}]`;
+}
+
+/**
+ * Refuses a key on an `http` or `sse` manual that spells `waitMs` differently
+ * (`waitms`, `wait_ms`, `waitMS`, `wait-ms`). Such a key is not read, so the bound
+ * the caller meant would silently never apply. Only the exact `waitMs` is accepted.
+ * The message names the manual and the key, not its value.
+ */
+function checkWaitKeySpelling(candidate: Record<string, unknown>, index: number): string | null {
+  const type = normalizeCallTemplateType(candidate.call_template_type);
+  if (type !== "http" && type !== "sse") return null;
+  for (const key of Object.keys(candidate)) {
+    if (key === "waitMs") continue;
+    if (key.toLowerCase().replace(/[_-]/g, "") !== "waitms") continue;
+    return `\`${displayText(key, 60)}\` on ${manualLabel(candidate, index)} is not a recognized option. Rename it to \`waitMs\` or remove it.`;
+  }
+  return null;
+}
+
 /**
  * Validates a manual's `waitMs`: only `http` and `sse` templates may carry it,
  * the manual must have a `name` (the cap and the expiry log are keyed by it), and
@@ -167,7 +192,7 @@ export function loadConfig(rawOptions: unknown, locationDirectory: string | unde
  */
 function checkWaitMs(candidate: Record<string, unknown>, index: number): string | null {
   const rawName = typeof candidate.name === "string" ? candidate.name.trim() : "";
-  const label = rawName.length > 0 ? `manual '${displayText(rawName.replace(/[^\w]/g, "_"), 80)}'` : `manuals[${index}]`;
+  const label = manualLabel(candidate, index);
   const type = normalizeCallTemplateType(candidate.call_template_type);
   if (type !== "http" && type !== "sse") {
     return `\`waitMs\` on ${label} is supported only on \`http\` and \`sse\` call templates. Remove \`waitMs\` or change the manual's call template type.`;

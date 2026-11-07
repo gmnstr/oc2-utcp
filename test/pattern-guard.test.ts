@@ -27,7 +27,8 @@ import { makeFakeHost } from "./helpers/host.js";
 import { startUtcpFixture, type UtcpFixtureServer } from "./fixtures/utcp-http-server.js";
 
 const LOWERCASE = "^[a-z]+$";
-const TIME_LIMIT_MESSAGE = "validation of the arguments exceeded the time limit.";
+const TIME_LIMIT_MESSAGE =
+  "validation of the arguments exceeded the time limit. The pattern may be hostile, or the host may have been too slow to start the validation worker; retry, and simplify the pattern if it keeps failing.";
 const STOPPED_MESSAGE = "validation of the arguments was stopped before it finished.";
 const MISS = {
   ok: false,
@@ -47,6 +48,32 @@ function patternSchema(pattern: string) {
 
 const cleanup: Array<() => Promise<void> | void> = [];
 
+/** Waits until every pattern worker has been reaped (exit reported, or grace ended), then asserts none is live. */
+async function expectNoLiveWorkers(): Promise<void> {
+  const until = Date.now() + 15_000;
+  while (livePatternWorkerCount() > 0 && Date.now() < until) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(livePatternWorkerCount()).toBe(0);
+}
+
+/** An object nested `containers` levels deep: a value at level k holds the value at level k+1. */
+function nestedArguments(containers: number): Record<string, unknown> {
+  let value: unknown = 0;
+  for (let level = 0; level < containers; level += 1) value = { a: value };
+  return value as Record<string, unknown>;
+}
+
+/** True when the first-child chain of `value` reaches at least `depth` levels of containers. */
+function depthAtLeast(value: unknown, depth: number): boolean {
+  let current = value;
+  for (let level = 0; level < depth; level += 1) {
+    if (typeof current !== "object" || current === null) return false;
+    current = Object.values(current)[0];
+  }
+  return true;
+}
+
 afterEach(async () => {
   terminatePatternWorkers();
   while (cleanup.length > 0) {
@@ -62,7 +89,7 @@ describe("pattern schemas (ReDoS guard)", () => {
 
     expect(await validateArgumentsGuarded(compiled, { s: "abc" })).toEqual({ ok: true });
     expect(await validateArgumentsGuarded(compiled, { s: "ABC" })).toEqual(MISS);
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   });
 
   test("a validation that misses its deadline is stopped, fails closed, and leaves the event loop alive", async () => {
@@ -83,7 +110,7 @@ describe("pattern schemas (ReDoS guard)", () => {
       received: "validation timed out",
       message: TIME_LIMIT_MESSAGE,
     });
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   });
 
   test("a schema without pattern takes the synchronous path and starts no worker", async () => {
@@ -98,10 +125,10 @@ describe("pattern schemas (ReDoS guard)", () => {
     expect(compiled.check.usesPattern).toBe(false);
 
     const pending = validateArgumentsGuarded(compiled, { n: 1, tags: ["x"] });
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
     expect(await pending).toEqual({ ok: true });
     expect(await validateArgumentsGuarded(compiled, { n: "one" })).toMatchObject({ ok: false, path: "arguments.n" });
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   });
 
   test("terminatePatternWorkers stops an in-flight validation, which settles failing closed at once", async () => {
@@ -112,7 +139,7 @@ describe("pattern schemas (ReDoS guard)", () => {
 
     // Called before the worker can answer, so the stop is what settles the call.
     terminatePatternWorkers();
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
     expect(await pending).toEqual({
       ok: false,
       path: "arguments",
@@ -141,7 +168,7 @@ describe("pattern schemas (ReDoS guard)", () => {
     });
 
     for (const result of await Promise.all(first)) expect(result).toEqual(MISS);
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   });
 
   test("the pre-checks run before any worker: an over-large argument is refused without one", async () => {
@@ -152,7 +179,7 @@ describe("pattern schemas (ReDoS guard)", () => {
     const args = { s: "abc", xs: Array.from({ length: MAX_ARG_NODES + 1 }, () => 0) };
 
     const pending = validateArgumentsGuarded(compiled, args, { deadlineMs: 5_000 });
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
     expect(await pending).toEqual({
       ok: false,
       path: "arguments",
@@ -217,7 +244,7 @@ describe("hostile patterns (kill path)", () => {
     expect((result as { message: string }).message).toBe(TIME_LIMIT_MESSAGE);
     expect(elapsed).toBeLessThan(3000);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
 
     // A worker that was not terminated would keep burning CPU while the host
     // waits. terminate() lets the regex run that is in progress finish (about
@@ -231,6 +258,35 @@ describe("hostile patterns (kill path)", () => {
     console.log(`hostile-patterns idle cpu: ${cpuMs.toFixed(1)} ms over 1000 ms`);
     expect(cpuMs).toBeLessThan(250);
   }, 20_000);
+});
+
+describe("live worker cap under repeated hostile calls", () => {
+  // Each call is sequential and hits the 500 ms deadline. A worker keeps its cap
+  // slot until it is reaped, so the live count must stay at or under the cap no
+  // matter how many terminated threads are still winding down.
+  test("ten sequential hostile calls each hit the deadline and never push the live count above the cap", async () => {
+    const properties: Record<string, unknown> = {};
+    const args: Record<string, string> = {};
+    for (const key of ["a", "b", "c", "d", "e", "f"]) {
+      properties[key] = { type: "string", pattern: "^(a+)+$" };
+      args[key] = `${"a".repeat(30)}!`;
+    }
+    const compiled = compileSchema({ type: "object", properties });
+    let peak = 0;
+    for (let call = 0; call < 10; call += 1) {
+      const result = await validateArgumentsGuarded(compiled, args, { deadlineMs: 500 });
+      expect(result).toEqual({
+        ok: false,
+        path: "arguments",
+        expected: "validation within the time limit",
+        received: "validation timed out",
+        message: TIME_LIMIT_MESSAGE,
+      });
+      peak = Math.max(peak, livePatternWorkerCount());
+    }
+    expect(peak).toBeLessThanOrEqual(MAX_PATTERN_WORKERS);
+    await expectNoLiveWorkers();
+  }, 60_000);
 });
 
 describe("hostile patterns through the adapter", () => {
@@ -270,6 +326,49 @@ describe("hostile patterns through the adapter", () => {
   }, 20_000);
 });
 
+describe("depth is measured before the arguments are copied", () => {
+  test("arguments nested 65 deep are refused VALIDATION_FAILED before any structuredClone sees them", async () => {
+    const server: UtcpFixtureServer = startUtcpFixture({
+      tools: [{ name: "deep", inputs: { type: "object" } }],
+    });
+    cleanup.push(() => server.stop());
+    const host = makeFakeHost({
+      manuals: [
+        {
+          name: "demo",
+          call_template_type: "http",
+          http_method: "GET",
+          url: `${server.url}/manual`,
+          content_type: "application/json",
+        },
+      ],
+    });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => {}, policyBaseline: () => "rule", disposeDeadlineMs: 500 });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    const realClone = globalThis.structuredClone;
+    const cloned: unknown[] = [];
+    globalThis.structuredClone = ((value: unknown, ...rest: unknown[]) => {
+      cloned.push(value);
+      return (realClone as (...args: unknown[]) => unknown)(value, ...rest);
+    }) as typeof structuredClone;
+    let result: Awaited<ReturnType<typeof host.runJson>>;
+    try {
+      result = await host.runJson("call", { name: "demo.deep", arguments: nestedArguments(65) });
+    } finally {
+      globalThis.structuredClone = realClone;
+    }
+
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe("VALIDATION_FAILED");
+    expect(result.error.message).toBe("arguments are nested too deeply.");
+    expect(cloned.some((value) => depthAtLeast(value, 65))).toBe(false);
+    expect(server.hits("deep")).toBe(0);
+    expect(host.asserts).toHaveLength(0);
+  }, 20_000);
+});
+
 describe("startup probe of the pattern worker", () => {
   test("the probe schema accepts 'a' and refuses 'b' as a pattern miss, through the guarded path", async () => {
     const compiled = compileSchema({
@@ -278,27 +377,27 @@ describe("startup probe of the pattern worker", () => {
     });
     expect(await validateArgumentsGuarded(compiled, { s: "a" })).toEqual({ ok: true });
     expect(await validateArgumentsGuarded(compiled, { s: "b" })).toMatchObject({ ok: false, path: "arguments.s" });
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   });
 
   test("probePatternWorker resolves true locally and leaves no worker alive", async () => {
     expect(await probePatternWorker()).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   }, 20_000);
 
   test("a probe whose deadline is missed resolves false, and still leaves no worker alive", async () => {
     // A worker cannot boot and answer within 1 ms, so the deadline path runs.
     expect(await probePatternWorker(1)).toBe(false);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   }, 20_000);
 
   test("a passing probe ran its own workers: the worker count rose by at least two during it", async () => {
     const before = patternWorkersStarted();
     expect(await probePatternWorker()).toBe(true);
     expect(patternWorkersStarted() - before).toBeGreaterThanOrEqual(2);
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   }, 20_000);
 });
 
@@ -355,7 +454,7 @@ describe("pattern nested under other keywords reaches the worker guard", () => {
       const refused = await validateArgumentsGuarded(compiled, testCase.miss);
       expect(refused.ok).toBe(false);
       expect(patternWorkersStarted() - before).toBeGreaterThanOrEqual(2);
-      expect(livePatternWorkerCount()).toBe(0);
+      await expectNoLiveWorkers();
     }, 20_000);
   }
 });
@@ -383,6 +482,8 @@ describe("dispose and a pattern validation still pending", () => {
 
     // Validation runs before the permission hook, so the pending point here is the
     // worker. The call reaches it synchronously, and the worker has not answered yet.
+    // The startup probe's two workers may still be winding down; wait for them so the count is ours.
+    await expectNoLiveWorkers();
     const pending = host.runJson("call", { name: "demo.pat", arguments: { s: "abc" } });
     expect(livePatternWorkerCount()).toBe(1);
 
@@ -395,6 +496,6 @@ describe("dispose and a pattern validation still pending", () => {
     expect(result.error.message).toBe(STOPPED_MESSAGE);
     expect(server.hits("pat")).toBe(0);
     expect(host.asserts).toHaveLength(0);
-    expect(livePatternWorkerCount()).toBe(0);
+    await expectNoLiveWorkers();
   }, 20_000);
 });

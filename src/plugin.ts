@@ -29,6 +29,7 @@ import {
 import {
   compileSchema,
   probePatternWorker,
+  refuseArgumentShape,
   terminatePatternWorkers,
   validateArgumentsGuarded,
   type CompiledSchema,
@@ -86,8 +87,12 @@ export const MAX_ABANDONED_PER_MANUAL = 8;
  * Calls per manual with `waitMs` that are dispatched and not yet settled or
  * released: calls still waiting, plus abandoned calls whose slot has not been
  * released (see MAX_ABANDONED_PER_MANUAL). The slot is reserved synchronously at
- * dispatch, so this is a hard bound on the calls in flight to one manual. At the
- * limit a new call is refused before dispatch with TOOL_UNAVAILABLE.
+ * dispatch, and this bounds the slots held, not the calls in flight: a slot is
+ * released when its call settles or, for an abandoned call, when its hold ends
+ * (ABANDON_HOLD_MS). The remote call may still be running after its hold ends, so
+ * the calls in flight can exceed this. At most MAX_ABANDONED_PER_MANUAL (8) calls
+ * per manual are held at once, so about 8 such released-while-running calls per
+ * five minutes. At the limit a new call is refused before dispatch with TOOL_UNAVAILABLE.
  */
 export const MAX_OUTSTANDING_PER_MANUAL = 32;
 
@@ -885,6 +890,19 @@ export class UtcpAdapter {
     // make the dispatched arguments differ from the validated ones.
     let snapshot: Record<string, unknown>;
     try {
+      // Depth and value count are measured on the caller's object first, so an
+      // adversarial shape is refused before it reaches structuredClone.
+      const shape = refuseArgumentShape(rawArgs);
+      if (shape !== undefined && shape.ok === false) {
+        return failure({
+          code: "VALIDATION_FAILED",
+          message: shape.message,
+          tool: entry.tool.name,
+          path: shape.path,
+          expected: shape.expected,
+          received: shape.received,
+        });
+      }
       snapshot = structuredClone(rawArgs) as Record<string, unknown>;
     } catch {
       return failure({

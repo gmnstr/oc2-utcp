@@ -60,6 +60,14 @@ export type LogEvent =
       event: "config";
       notice: "patternGuard";
       available: boolean;
+    }
+  | {
+      /**
+       * A pattern-validation worker did not report its exit within the grace period
+       * after it was terminated, so it was released from the live-worker cap anyway.
+       */
+      event: "config";
+      notice: "patternWorkerStuck";
     };
 
 export interface Logger {

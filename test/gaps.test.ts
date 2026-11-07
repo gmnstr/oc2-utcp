@@ -461,6 +461,27 @@ describe("waitMs configuration (D2 4)", () => {
     expect(adapter.status().state).toBe("ready");
   }, 20_000);
 
+  test.each([
+    ["http", "waitms"],
+    ["http", "wait_ms"],
+    ["http", "waitMS"],
+    ["http", "wait-ms"],
+    ["sse", "wait_ms"],
+  ])("a %s manual with the key '%s' instead of waitMs is CONFIG_INVALID naming the manual and key", async (type, key) => {
+    const { host, adapter } = await startWithTemplate({
+      name: "demo",
+      call_template_type: type,
+      url: "http://127.0.0.1:1/m",
+      [key]: 1000,
+    });
+
+    expect(adapter.status().state).toBe("closed");
+    expect(adapter.status().error?.code).toBe("CONFIG_INVALID");
+    expect(adapter.status().error?.message).toContain("'demo'");
+    expect(adapter.status().error?.message).toContain(`\`${key}\``);
+    expect(await host.listNames()).toEqual([]);
+  });
+
   test("waitMs at the bounds is accepted on http and sse, and is never forwarded to the SDK", async () => {
     const server = fixture();
     type Register = (templates: Array<Record<string, unknown>>) => Promise<unknown>;
