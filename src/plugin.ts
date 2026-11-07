@@ -35,6 +35,7 @@ import {
   type CompiledSchema,
 } from "./schema.js";
 import { manualOf, toDescription, toListItem } from "./projection.js";
+import { boundedJsonStringify } from "./output.js";
 import { createLogger, type LogEvent, type Logger } from "./log.js";
 import {
   classifyThrown,
@@ -45,6 +46,7 @@ import {
   type ErrorBody,
   type FailureResult,
   type ManualStatus,
+  UtcpAdapterError,
 } from "./errors.js";
 
 const NAMESPACE = "utcp";
@@ -64,6 +66,12 @@ const PREFIXED_NAMES = OWNED_NAMES.map((name) => `${NAMESPACE}_${name}`) as read
 
 const DEFAULT_SEARCH_LIMIT = 10;
 const MAX_SEARCH_LIMIT = 50;
+
+/** Hard admission limits for unsettled SDK calls, regardless of waitMs or transport. */
+export const MAX_INFLIGHT_GLOBAL = 64;
+export const MAX_INFLIGHT_PER_MANUAL = 32;
+/** Prevent unbounded catalog schema compilation after registration. */
+export const MAX_CATALOG_TOOLS = 512;
 
 /**
  * Upper bound on each dispose wait: in-flight calls, the registration disposal,
@@ -224,6 +232,8 @@ export class UtcpAdapter {
   private registeredManuals: string[] = [];
   private effectiveNames: readonly string[] = [];
   private readonly inflight = new Set<Promise<unknown>>();
+  /** Actual unsettled transports, not slots that can expire on a wait deadline. */
+  private readonly inflightByManual = new Map<string, number>();
   /** Insertion-ordered; the oldest session is evicted past MAX_POLICY_SESSIONS. */
   private readonly policyChecked = new Set<string>();
   /** Per-manual `waitMs` bound, keyed by the registered manual name. Never sent to the SDK. */
@@ -441,6 +451,12 @@ export class UtcpAdapter {
     const byName = new Map(this.manuals.map((status) => [status.name, status]));
     const byTemplate = new Map(candidates.map((candidate) => [candidate.name, candidate]));
     const tools = await client.getTools();
+    if (tools.length > MAX_CATALOG_TOOLS) {
+      throw new UtcpAdapterError(
+        "CONFIG_INVALID",
+        `UTCP discovered more than ${MAX_CATALOG_TOOLS} tools; the catalog was refused before schema compilation.`,
+      );
+    }
 
     for (const tool of tools) {
       const manual = manualOf(tool);
@@ -704,7 +720,22 @@ export class UtcpAdapter {
   // ------------------------------------------------------------------- tools
 
   private wrap(result: unknown): ToolExecuteResult {
-    return { content: JSON.stringify(result) };
+    const content = boundedJsonStringify(result);
+    if (content !== null) return { content };
+    // This is a presentation bound, not a pre-parse transport memory bound.
+    // A successful invocation may have mutated remote state before its result
+    // exceeded this limit. Never make the oversized result appear successful.
+    const postDispatch =
+      isObject(result) && result.ok === true && Object.prototype.hasOwnProperty.call(result, "result");
+    return {
+      content: JSON.stringify(failure({
+        code: "RESULT_TOO_LARGE",
+        message: postDispatch
+          ? "The UTCP result exceeded the model-facing output budget. The remote operation may have completed; check remote state before retrying."
+          : "UTCP metadata exceeded the model-facing output budget and was not returned.",
+        ...(postDispatch ? { outcome: "unknown" as const } : {}),
+      })),
+    };
   }
 
   private gate(): FailureResult | null {
@@ -971,6 +1002,21 @@ export class UtcpAdapter {
       });
     }
 
+    // The hard bounds account for EVERY transport, even after a caller stops
+    // waiting. They release only when the SDK promise actually settles.
+    if (
+      this.inflight.size >= MAX_INFLIGHT_GLOBAL ||
+      (this.inflightByManual.get(entry.manual) ?? 0) >= MAX_INFLIGHT_PER_MANUAL
+    ) {
+      this.logCall(entry, context, invocationID, Date.now() - startedAt, false, "TOOL_UNAVAILABLE");
+      return failure({
+        code: "TOOL_UNAVAILABLE",
+        message: "The adapter has reached its limit of unsettled calls. This request was not dispatched; wait for outstanding operations to settle.",
+        tool: name,
+        retryable: true,
+      });
+    }
+
     // Two bounds, both checked before dispatch. Each counts only calls to a manual
     // with `waitMs` (other manuals never have entries). At either limit the call is
     // refused before anything is sent, so this is not an outcome-unknown result.
@@ -1009,9 +1055,10 @@ export class UtcpAdapter {
       }
     }
 
-    // The slot is reserved here, synchronously and before callTool, so the count
-    // never lags a dispatch. A manual without `waitMs` has no slot.
+    // Reserve capacity synchronously before calling the SDK. The hard count
+    // persists until settlement, even when an older waitMs hold slot expires.
     const slot = waitMs === undefined ? undefined : this.reserveSlot(entry.manual);
+    this.adjustCount(this.inflightByManual, entry.manual, 1);
 
     // `callTool` takes no AbortSignal, so this promise is the only handle on the
     // transport work; it is tracked so cleanup can account for it.
@@ -1020,6 +1067,7 @@ export class UtcpAdapter {
       pending = client.callTool(name, args);
     } catch (error) {
       slot?.release();
+      this.adjustCount(this.inflightByManual, entry.manual, -1);
       throw error;
     }
     this.inflight.add(pending);
@@ -1027,6 +1075,7 @@ export class UtcpAdapter {
     const markSettled = () => {
       settled = true;
       this.inflight.delete(pending);
+      this.adjustCount(this.inflightByManual, entry.manual, -1);
       slot?.release();
     };
     pending.then(markSettled, markSettled);
@@ -1074,8 +1123,19 @@ export class UtcpAdapter {
       pending.catch(() => {});
       const durationMs = Date.now() - startedAt;
       const body = classifyThrown(error, name);
+      // After a transport attempt, socket errors and remote rejections do not
+      // prove that a mutating operation was not committed before the failure.
+      // Keep configuration failures that are known to be pre-dispatch distinct.
+      const uncertain = body.code !== "CONFIGURATION_ERROR" && body.code !== "CONFIG_INVALID";
+      const reported = uncertain
+        ? {
+            ...body,
+            outcome: "unknown" as const,
+            message: `${body.message} The operation may have completed; check remote state before retrying a mutating call.`,
+          }
+        : body;
       this.logCall(entry, context, invocationID, durationMs, false, body.code);
-      return failure(body);
+      return failure(reported);
     } finally {
       clearTimeout(waitTimer);
       signal?.removeEventListener("abort", onAbort);

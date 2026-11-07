@@ -58,6 +58,8 @@ export const MAX_REF_DEPTH = 64;
 export const MAX_ARG_DEPTH = 64;
 /** Values (object members, array items and the root) counted before arguments are refused as too many. */
 export const MAX_ARG_NODES = 100_000;
+/** UTF-8 argument budget enforced before structuredClone or worker messaging. */
+export const MAX_ARG_BYTES = 1_048_576;
 
 /** Literal nesting depth of schema objects, as the walk recurses. */
 const MAX_SCHEMA_DEPTH = 64;
@@ -741,7 +743,7 @@ function describeAjvError(error: ErrorObject, data: unknown, base: string): Argu
 }
 
 /** Which measurement limit the arguments exceeded, if any. */
-type ArgumentShape = "ok" | "deep" | "many";
+type ArgumentShape = "ok" | "deep" | "many" | "bytes";
 
 interface ArgumentMeasure {
   /**
@@ -760,6 +762,7 @@ interface ArgumentMeasure {
 function measureArguments(value: unknown): ArgumentMeasure {
   const stack: Array<{ value: unknown; level: number }> = [{ value, level: 0 }];
   let visited = 0;
+  let bytes = 0;
   while (stack.length > 0) {
     const entry = stack.pop();
     if (entry === undefined) break;
@@ -767,10 +770,24 @@ function measureArguments(value: unknown): ArgumentMeasure {
     if (visited > MAX_ARG_NODES) return { shape: "many", nodes: visited };
 
     const { value: current, level } = entry;
+    // The conservative scalar accounting includes syntax overhead. Escaping
+    // can expand JSON later; this is the pre-clone memory/work budget only.
+    if (typeof current === "string") bytes += Buffer.byteLength(current, "utf8") + 2;
+    else if (typeof current === "number") bytes += 32;
+    else if (typeof current === "boolean") bytes += 5;
+    else bytes += 4;
+    if (bytes > MAX_ARG_BYTES) return { shape: "bytes", nodes: visited };
     let children: unknown[] | null = null;
     if (Array.isArray(current)) {
       children = current;
     } else if (isRecord(current)) {
+      // Keys also consume memory and can be attacker-controlled. Count them
+      // before making the validation snapshot.
+      const keys = Object.keys(current);
+      for (const key of keys) {
+        bytes += Buffer.byteLength(key, "utf8") + 3;
+        if (bytes > MAX_ARG_BYTES) return { shape: "bytes", nodes: visited };
+      }
       children = Object.values(current);
     }
     if (children === null) continue;
@@ -795,6 +812,14 @@ const ARGUMENTS_TOO_MANY: ArgumentValidation = {
   expected: `arguments with at most ${MAX_ARG_NODES} values`,
   received: "too many values",
   message: "arguments contain too many values.",
+};
+
+const ARGUMENTS_TOO_MANY_BYTES: ArgumentValidation = {
+  ok: false,
+  path: "arguments",
+  expected: `arguments of at most ${MAX_ARG_BYTES} UTF-8 bytes`,
+  received: "too many bytes",
+  message: "arguments exceed the pre-dispatch byte budget.",
 };
 
 const ARGUMENTS_TOO_LARGE: ArgumentValidation = {
@@ -847,6 +872,7 @@ export function refuseArgumentShape(args: unknown): ArgumentValidation | undefin
 function shapeRefusal(measured: ArgumentMeasure): ArgumentValidation | undefined {
   if (measured.shape === "deep") return ARGUMENTS_TOO_DEEP;
   if (measured.shape === "many") return ARGUMENTS_TOO_MANY;
+  if (measured.shape === "bytes") return ARGUMENTS_TOO_MANY_BYTES;
   return undefined;
 }
 
