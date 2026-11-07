@@ -26,7 +26,14 @@ import {
   normalizeCallTemplateType,
   type TransportClass,
 } from "./transport.js";
-import { compileSchema, validateArguments, type CompiledSchema } from "./schema.js";
+import {
+  compileSchema,
+  probePatternWorker,
+  refuseArgumentShape,
+  terminatePatternWorkers,
+  validateArgumentsGuarded,
+  type CompiledSchema,
+} from "./schema.js";
 import { manualOf, toDescription, toListItem } from "./projection.js";
 import { createLogger, type LogEvent, type Logger } from "./log.js";
 import {
@@ -34,6 +41,7 @@ import {
   displayText,
   failure,
   isObject,
+  waitDeadlineExpired,
   type ErrorBody,
   type FailureResult,
   type ManualStatus,
@@ -65,6 +73,41 @@ const MAX_SEARCH_LIMIT = 50;
  * dispose can take up to the sum of the stages in the worst case.
  */
 const DEFAULT_DISPOSE_DEADLINE_MS = 10_000;
+
+/**
+ * Calls returned early and still unsettled allowed per manual with `waitMs`: calls
+ * that expired at the deadline, and calls the caller aborted. The SDK cannot
+ * cancel a call, so each one keeps its socket and promise alive until the
+ * remote side answers. At the cap, new calls to that manual are refused
+ * before dispatch, so a hung server cannot accumulate unbounded in-flight work.
+ */
+export const MAX_ABANDONED_PER_MANUAL = 8;
+
+/**
+ * Calls per manual with `waitMs` that are dispatched and not yet settled or
+ * released: calls still waiting, plus abandoned calls whose slot has not been
+ * released (see MAX_ABANDONED_PER_MANUAL). The slot is reserved synchronously at
+ * dispatch, and this bounds the slots held, not the calls in flight: a slot is
+ * released when its call settles or, for an abandoned call, when its hold ends
+ * (ABANDON_HOLD_MS). The remote call may still be running after its hold ends, so
+ * the calls in flight can exceed this. At most MAX_ABANDONED_PER_MANUAL (8) calls
+ * per manual are held at once, so about 8 such released-while-running calls per
+ * five minutes. At the limit a new call is refused before dispatch with TOOL_UNAVAILABLE.
+ */
+export const MAX_OUTSTANDING_PER_MANUAL = 32;
+
+const OUTSTANDING_REFUSAL_MESSAGE =
+  "This manual already has the maximum number of calls in progress or still running after their wait deadline, so this call was not sent. Retry in a few minutes.";
+
+/**
+ * How long an abandoned call holds its slot against MAX_ABANDONED_PER_MANUAL,
+ * counted from the moment it was abandoned. A slot is released at the earlier
+ * of this and the call settling. The promise stays tracked in `inflight` until
+ * it settles, so dispose still accounts for it. A remote call that never
+ * settles therefore stops blocking its manual after this long, but its socket
+ * may remain open.
+ */
+export const ABANDON_HOLD_MS = 300_000;
 
 /**
  * Sessions remembered by the policy-baseline probe. The probe runs once per
@@ -149,6 +192,8 @@ export interface AdapterHooks {
   installMcpProtocol?: () => NoRetryInstallation;
   /** Bound on each dispose wait (in-flight calls, client close). Tests lower it. */
   disposeDeadlineMs?: number;
+  /** How long an abandoned call holds its cap slot (ABANDON_HOLD_MS). Tests lower it. */
+  abandonHoldMs?: number;
 }
 
 interface CallContext {
@@ -161,6 +206,7 @@ interface CallContext {
 }
 
 const ABORTED = Symbol("aborted");
+const WAIT_EXPIRED = Symbol("waitExpired");
 
 let ACTIVE: UtcpAdapter | null = null;
 
@@ -180,6 +226,14 @@ export class UtcpAdapter {
   private readonly inflight = new Set<Promise<unknown>>();
   /** Insertion-ordered; the oldest session is evicted past MAX_POLICY_SESSIONS. */
   private readonly policyChecked = new Set<string>();
+  /** Per-manual `waitMs` bound, keyed by the registered manual name. Never sent to the SDK. */
+  private readonly waitMsByManual = new Map<string, number>();
+  /** Dispatched-but-unreleased calls per manual with `waitMs` (see MAX_OUTSTANDING_PER_MANUAL). */
+  private readonly outstandingByManual = new Map<string, number>();
+  /** Expired-but-unsettled calls per manual; each slot is released at settle or at the hold deadline. */
+  private readonly abandonedByManual = new Map<string, number>();
+  /** Hold timers of abandoned slots not yet released; cleared on settle and in dispose. */
+  private readonly abandonHoldTimers = new Set<ReturnType<typeof setTimeout>>();
   private mcpRetrySuppressed = false;
   private initError: ErrorBody | null = null;
 
@@ -217,6 +271,11 @@ export class UtcpAdapter {
       await this.failStartup(classifyThrown(error));
       return;
     }
+
+    // One pattern-worker probe per startup, before readiness. It is bounded by
+    // its own deadline and never throws; a false result is reported, not fatal.
+    const patternGuardAvailable = await probePatternWorker();
+    this.logger.emit({ event: "config", notice: "patternGuard", available: patternGuardAvailable });
 
     try {
       await this.registerTools();
@@ -297,7 +356,7 @@ export class UtcpAdapter {
     this.client = client;
 
     // Step 2: classify, drop disabled classes before anything is registered.
-    const candidates: { template: CallTemplate; transport: TransportClass; name: string }[] = [];
+    const candidates: { template: CallTemplate; transport: TransportClass; name: string; waitMs?: number }[] = [];
     for (const template of config.manuals) {
       const transport = classifyManual(template);
       const name = manualNameFromTemplate(template);
@@ -324,12 +383,21 @@ export class UtcpAdapter {
         });
         continue;
       }
-      candidates.push({ template: { ...template }, transport, name });
+      // `waitMs` is the adapter's own option (validated in loadConfig). It is
+      // stripped here so the SDK never receives a key it does not define.
+      const { waitMs, ...sdkTemplate } = template as CallTemplate & { waitMs?: unknown };
+      candidates.push({
+        template: sdkTemplate as CallTemplate,
+        transport,
+        name,
+        waitMs: typeof waitMs === "number" ? waitMs : undefined,
+      });
     }
 
     // Only streamable_http honours `timeout`. http and sse templates accept the
     // key and then ignore it, so an operator who sets it gets no effect. Report
-    // it once per manual; the value itself is not logged.
+    // it once per manual, whether or not the manual also has a `waitMs` bound:
+    // `timeout` is ignored in both cases. The value itself is not logged.
     for (const candidate of candidates) {
       const type = normalizeCallTemplateType(candidate.template.call_template_type);
       if ((type === "http" || type === "sse") && "timeout" in candidate.template) {
@@ -347,6 +415,7 @@ export class UtcpAdapter {
       if (result.success) {
         this.registeredManuals.push(name);
         candidate.name = name;
+        if (candidate.waitMs !== undefined) this.waitMsByManual.set(name, candidate.waitMs);
         this.manuals.push({
           name,
           transport: candidate.transport,
@@ -510,6 +579,16 @@ export class UtcpAdapter {
     this.state = "closing";
     this.logger.emit({ event: "lifecycle", phase: "closing" });
 
+    // Pattern validations still running are stopped here. This is synchronous
+    // and each one settles at once as a refusal, so it adds no wait. A stopped
+    // call returns a validation failure and is never dispatched.
+    terminatePatternWorkers();
+
+    // Hold timers are cleared here. Each abandoned call still releases its slot
+    // when its promise settles, and the `released` flag keeps that to one release.
+    for (const timer of this.abandonHoldTimers) clearTimeout(timer);
+    this.abandonHoldTimers.clear();
+
     // Calls already dispatched cannot be cancelled (the SDK takes no signal);
     // account for them rather than claiming they stopped. The wait is bounded
     // so a call that never answers cannot hang the unload; an abandoned call is
@@ -599,6 +678,10 @@ export class UtcpAdapter {
 
   private disposeDeadlineMs(): number {
     return this.hooks.disposeDeadlineMs ?? DEFAULT_DISPOSE_DEADLINE_MS;
+  }
+
+  private abandonHoldMs(): number {
+    return this.hooks.abandonHoldMs ?? ABANDON_HOLD_MS;
   }
 
   /** Diagnostics for tests and operators; never contains credentials. */
@@ -713,7 +796,7 @@ export class UtcpAdapter {
     const gate = this.gate();
     if (gate !== null) return gate;
 
-    const prepared = this.prepareCall(input, context);
+    const prepared = await this.prepareCall(input, context);
     if (prepared.ok === false) return prepared;
 
     // Permission errors must propagate natively: they are not tool output.
@@ -729,10 +812,10 @@ export class UtcpAdapter {
     return this.invoke(prepared.entry, prepared.args, context);
   }
 
-  private prepareCall(
+  private async prepareCall(
     input: unknown,
     context: CallContext,
-  ): FailureResult | { ok: true; entry: CatalogEntry; args: Record<string, unknown> } {
+  ): Promise<FailureResult | { ok: true; entry: CatalogEntry; args: Record<string, unknown> }> {
     const raw = isObject(input) ? input : {};
     const name = typeof raw.name === "string" ? raw.name.trim() : "";
     if (name.length === 0) {
@@ -778,8 +861,7 @@ export class UtcpAdapter {
       });
     }
 
-    const validate = entry.compiled.validate;
-    if (typeof validate !== "function") {
+    if (typeof entry.compiled.validate !== "function") {
       return failure({
         code: "SCHEMA_UNSUPPORTED",
         message: "The tool's input schema could not be compiled, so the tool is not executable.",
@@ -803,7 +885,39 @@ export class UtcpAdapter {
       });
     }
 
-    const validation = validateArguments(validate, rawArgs);
+    // Validation and dispatch use this one copy. The copy is taken before the
+    // first await, so a getter, proxy or caller mutation during the await cannot
+    // make the dispatched arguments differ from the validated ones.
+    let snapshot: Record<string, unknown>;
+    try {
+      // Depth and value count are measured on the caller's object first, so an
+      // adversarial shape is refused before it reaches structuredClone.
+      const shape = refuseArgumentShape(rawArgs);
+      if (shape !== undefined && shape.ok === false) {
+        return failure({
+          code: "VALIDATION_FAILED",
+          message: shape.message,
+          tool: entry.tool.name,
+          path: shape.path,
+          expected: shape.expected,
+          received: shape.received,
+        });
+      }
+      snapshot = structuredClone(rawArgs) as Record<string, unknown>;
+    } catch {
+      return failure({
+        code: "INVALID_ARGUMENTS",
+        message: "`arguments` could not be copied for validation, so the call was not sent.",
+        tool: displayText(entry.tool.name, 120),
+        path: "arguments.arguments",
+        expected: "plain data object",
+        received: "uncopyable object",
+      });
+    }
+
+    // Pattern schemas are validated in a worker with a deadline (see schema.ts);
+    // this await is the only point where validation leaves the host thread.
+    const validation = await validateArgumentsGuarded(entry.compiled, snapshot);
     if (validation.ok === false) {
       return failure({
         code: "VALIDATION_FAILED",
@@ -816,7 +930,7 @@ export class UtcpAdapter {
     }
 
     this.notePolicyBaseline(context);
-    return { ok: true, entry, args: rawArgs };
+    return { ok: true, entry, args: snapshot };
   }
 
   private async assertPermission(entry: CatalogEntry, context: CallContext): Promise<void> {
@@ -857,6 +971,33 @@ export class UtcpAdapter {
       });
     }
 
+    // Two bounds, both checked before dispatch. Each counts only calls to a manual
+    // with `waitMs` (other manuals never have entries). At either limit the call is
+    // refused before anything is sent, so this is not an outcome-unknown result.
+    // The outstanding bound counts every dispatched call not yet released, waiting
+    // and abandoned alike. The abandoned bound counts calls returned early that are
+    // still running remotely.
+    const waitMs = this.waitMsByManual.get(entry.manual);
+    if ((this.outstandingByManual.get(entry.manual) ?? 0) >= MAX_OUTSTANDING_PER_MANUAL) {
+      this.logCall(entry, context, invocationID, Date.now() - startedAt, false, "TOOL_UNAVAILABLE");
+      return failure({
+        code: "TOOL_UNAVAILABLE",
+        message: OUTSTANDING_REFUSAL_MESSAGE,
+        tool: name,
+        retryable: true,
+      });
+    }
+    if ((this.abandonedByManual.get(entry.manual) ?? 0) >= MAX_ABANDONED_PER_MANUAL) {
+      this.logCall(entry, context, invocationID, Date.now() - startedAt, false, "TOOL_UNAVAILABLE");
+      return failure({
+        code: "TOOL_UNAVAILABLE",
+        message:
+          "This manual already has the maximum number of calls still running after their wait deadline, so this call was not sent. Retry in a few minutes.",
+        tool: name,
+        retryable: true,
+      });
+    }
+
     if (typeof context.progress === "function") {
       // Progress is advisory and is not awaited: a hook that never settles must
       // not hold the call before dispatch, and nothing here can cancel it. It is
@@ -868,14 +1009,27 @@ export class UtcpAdapter {
       }
     }
 
+    // The slot is reserved here, synchronously and before callTool, so the count
+    // never lags a dispatch. A manual without `waitMs` has no slot.
+    const slot = waitMs === undefined ? undefined : this.reserveSlot(entry.manual);
+
     // `callTool` takes no AbortSignal, so this promise is the only handle on the
     // transport work; it is tracked so cleanup can account for it.
-    const pending: Promise<unknown> = client.callTool(name, args);
+    let pending: Promise<unknown>;
+    try {
+      pending = client.callTool(name, args);
+    } catch (error) {
+      slot?.release();
+      throw error;
+    }
     this.inflight.add(pending);
-    pending.then(
-      () => this.inflight.delete(pending),
-      () => this.inflight.delete(pending),
-    );
+    let settled = false;
+    const markSettled = () => {
+      settled = true;
+      this.inflight.delete(pending);
+      slot?.release();
+    };
+    pending.then(markSettled, markSettled);
 
     let outcome: unknown;
     let aborted = false;
@@ -888,20 +1042,32 @@ export class UtcpAdapter {
     // signal for the rest of the process, one per completed call.
     let onRaceAbort: (() => void) | undefined;
     signal?.addEventListener("abort", onAbort, { once: true });
+    const abortRace = new Promise<typeof ABORTED>((resolve) => {
+      if (signal?.aborted) {
+        aborted = true;
+        resolve(ABORTED);
+        return;
+      }
+      onRaceAbort = () => resolve(ABORTED);
+      signal?.addEventListener("abort", onRaceAbort, { once: true });
+    });
+
+    // Bounded wait (`waitMs`, http and sse only). Armed after dispatch, cleared
+    // on every exit path below. The timer is unref'd so it never keeps the host
+    // process alive by itself.
+    let waitTimer: ReturnType<typeof setTimeout> | undefined;
+    const waitExpired =
+      waitMs === undefined
+        ? undefined
+        : new Promise<typeof WAIT_EXPIRED>((resolve) => {
+            waitTimer = setTimeout(() => resolve(WAIT_EXPIRED), waitMs);
+            waitTimer.unref();
+          });
+    const racers: Promise<unknown>[] = [pending, abortRace];
+    if (waitExpired !== undefined) racers.push(waitExpired);
 
     try {
-      outcome = await Promise.race([
-        pending,
-        new Promise<typeof ABORTED>((resolve) => {
-          if (signal?.aborted) {
-            aborted = true;
-            resolve(ABORTED);
-            return;
-          }
-          onRaceAbort = () => resolve(ABORTED);
-          signal?.addEventListener("abort", onRaceAbort, { once: true });
-        }),
-      ]);
+      outcome = await Promise.race(racers);
     } catch (error) {
       // The SDK call cannot be cancelled; swallow a late rejection so an
       // abandoned call never becomes an unhandled rejection.
@@ -911,6 +1077,7 @@ export class UtcpAdapter {
       this.logCall(entry, context, invocationID, durationMs, false, body.code);
       return failure(body);
     } finally {
+      clearTimeout(waitTimer);
       signal?.removeEventListener("abort", onAbort);
       if (onRaceAbort !== undefined) signal?.removeEventListener("abort", onRaceAbort);
     }
@@ -920,6 +1087,23 @@ export class UtcpAdapter {
     pending.catch(() => {});
 
     const durationMs = Date.now() - startedAt;
+
+    // A call returned to the caller before it settled (expired at waitMs, or
+    // abandoned by the caller's abort) still runs remotely. For a manual with
+    // waitMs it counts against the cap until it settles. Other manuals are unchanged.
+    const returnedEarly = outcome === WAIT_EXPIRED || aborted || outcome === ABORTED;
+    if (slot !== undefined && returnedEarly && !settled) slot.abandon();
+
+    // Race outcome: a call that completes exactly at the deadline may still be
+    // reported here as TIMEOUT with outcome unknown, because the race can pick the
+    // timer over a result that is one tick behind it. That is conservative: the
+    // caller is told the outcome is unknown, and nothing is retried.
+    if (outcome === WAIT_EXPIRED && waitMs !== undefined) {
+      // The adapter stops waiting; the call is not cancelled. It stays in
+      // `inflight` until it settles, and counts against the cap until then.
+      this.logCall(entry, context, invocationID, durationMs, false, "TIMEOUT", waitMs);
+      return failure(waitDeadlineExpired(name, waitMs));
+    }
 
     if (aborted || outcome === ABORTED) {
       this.logCall(entry, context, invocationID, durationMs, false, "INTERNAL_ERROR");
@@ -947,6 +1131,7 @@ export class UtcpAdapter {
     durationMs: number,
     ok: boolean,
     code: string | undefined,
+    waitMs?: number,
   ): void {
     this.logger.emit({
       event: "call",
@@ -956,9 +1141,56 @@ export class UtcpAdapter {
       durationMs,
       ok,
       ...(code === undefined ? {} : { code }),
+      ...(waitMs === undefined ? {} : { timedOut: true, waitMs }),
       sessionID: context.sessionID,
       invocationID,
     });
+  }
+
+  /**
+   * Reserves one slot against the manual's outstanding bound for a call that is
+   * about to be dispatched. `release` frees it once: when the call settles, or when
+   * the hold of an abandoned call ends. `abandon` marks a call the adapter returned
+   * to its caller before it settled (expired at waitMs, or aborted by the caller).
+   * An abandoned call also counts against MAX_ABANDONED_PER_MANUAL until it is
+   * released, and its hold timer releases it at ABANDON_HOLD_MS if it has not
+   * settled by then. The `released` flag makes the release happen once.
+   */
+  private reserveSlot(manual: string): { release: () => void; abandon: () => void } {
+    this.adjustCount(this.outstandingByManual, manual, 1);
+    let released = false;
+    let abandoned = false;
+    let holdTimer: ReturnType<typeof setTimeout> | undefined;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (holdTimer !== undefined) {
+        clearTimeout(holdTimer);
+        this.abandonHoldTimers.delete(holdTimer);
+      }
+      this.adjustCount(this.outstandingByManual, manual, -1);
+      if (abandoned) this.adjustCount(this.abandonedByManual, manual, -1);
+    };
+    const abandon = () => {
+      if (released || abandoned) return;
+      abandoned = true;
+      this.adjustCount(this.abandonedByManual, manual, 1);
+      // Once dispose has cleared the hold timers it must not create new ones: the
+      // slot is then released by the call settling, which dispose accounts for.
+      if (this.state === "closing" || this.state === "closed") return;
+      holdTimer = setTimeout(release, this.abandonHoldMs());
+      // Unref'd so the hold never keeps the host process alive by itself.
+      holdTimer.unref();
+      this.abandonHoldTimers.add(holdTimer);
+    };
+    return { release, abandon };
+  }
+
+  /** Adds `delta` to a per-manual count, deleting the entry at zero so no count goes negative. */
+  private adjustCount(counts: Map<string, number>, manual: string, delta: 1 | -1): void {
+    const next = (counts.get(manual) ?? 0) + delta;
+    if (next > 0) counts.set(manual, next);
+    else counts.delete(manual);
   }
 
   private notePolicyBaseline(context: CallContext): void {

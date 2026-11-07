@@ -258,12 +258,26 @@ describe("policy baseline scan (A-policy)", () => {
 
 describe("ignored timeout notice (A-timeout)", () => {
   function configEvents(events: LogEvent[]): LogEvent[] {
-    return events.filter((event) => event.event === "config");
+    return events.filter((event) => event.event === "config" && event.notice === "timeoutIgnored");
   }
 
   test("an http manual with a timeout emits one timeoutIgnored notice without the value", async () => {
     const server = fixture();
     const host = makeFakeHost({ manuals: [httpManual("demo", server, { timeout: 4321 })] });
+    const events: LogEvent[] = [];
+    const adapter = new UtcpAdapter(host.ctx, { log: (event) => events.push(event), policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    expect(configEvents(events)).toEqual([
+      { event: "config", notice: "timeoutIgnored", manual: "demo", template: "http" },
+    ]);
+    expect(JSON.stringify(events)).not.toContain("4321");
+  }, 20_000);
+
+  test("an http manual with both timeout and waitMs still emits the notice, since timeout is ignored either way", async () => {
+    const server = fixture();
+    const host = makeFakeHost({ manuals: [httpManual("demo", server, { timeout: 4321, waitMs: 1000 })] });
     const events: LogEvent[] = [];
     const adapter = new UtcpAdapter(host.ctx, { log: (event) => events.push(event), policyBaseline: () => "rule" });
     await adapter.start();
@@ -464,5 +478,23 @@ describe("advisory progress hook (W7-5)", () => {
 
     expect(result.ok).toBe(true);
     expect(server.hits("echo")).toBe(1);
+  }, 20_000);
+});
+
+describe("pattern guard startup notice", () => {
+  test("one patternGuard notice with available true is logged before the adapter is ready", async () => {
+    const server = fixture();
+    const host = makeFakeHost({ manuals: [httpManual("demo", server)] });
+    const events: LogEvent[] = [];
+    const adapter = new UtcpAdapter(host.ctx, { log: (event) => events.push(event), policyBaseline: () => "rule" });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+
+    const notices = events.filter((event) => event.event === "config" && event.notice === "patternGuard");
+    expect(notices).toEqual([{ event: "config", notice: "patternGuard", available: true }]);
+
+    const noticeAt = events.indexOf(notices[0]!);
+    const readyAt = events.findIndex((event) => event.event === "lifecycle" && event.phase === "ready");
+    expect(readyAt).toBeGreaterThan(noticeAt);
   }, 20_000);
 });

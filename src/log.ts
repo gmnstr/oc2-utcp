@@ -17,6 +17,10 @@ export type LogEvent =
       durationMs: number;
       ok: boolean;
       code?: string;
+      /** Present only for a call the adapter stopped awaiting at its `waitMs` deadline. */
+      timedOut?: true;
+      /** The manual's `waitMs`, present together with `timedOut`. */
+      waitMs?: number;
       sessionID: string;
       invocationID: string;
     }
@@ -46,6 +50,24 @@ export type LogEvent =
       notice: "timeoutIgnored";
       manual: string;
       template: "http" | "sse";
+    }
+  | {
+      /**
+       * Logged once at startup. `available: false` means the probe did not confirm
+       * the pattern guard in this runtime. Calls to tools whose schema uses `pattern`
+       * still go through the worker, and fail closed if it cannot run.
+       */
+      event: "config";
+      notice: "patternGuard";
+      available: boolean;
+    }
+  | {
+      /**
+       * A pattern-validation worker did not report its exit within the grace period
+       * after it was terminated, so it was released from the live-worker cap anyway.
+       */
+      event: "config";
+      notice: "patternWorkerStuck";
     };
 
 export interface Logger {

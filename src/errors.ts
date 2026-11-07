@@ -227,6 +227,21 @@ function transportTimeout(tool: string | undefined): ErrorBody {
 }
 
 /**
+ * The adapter stopped waiting on a manual that opted into a bounded wait
+ * (`waitMs`). The call was not cancelled, so the remote side may still complete
+ * it: the outcome is unknown, never "failed". The message is a fixed template
+ * and carries no remote text.
+ */
+export function waitDeadlineExpired(tool: string, waitMs: number): ErrorBody {
+  return {
+    code: "TIMEOUT",
+    message: `The adapter stopped waiting for ${toolLabel(tool)} after ${waitMs} ms (the manual's waitMs). The request was not cancelled, and the remote side may still complete it. Check the remote side before retrying anything that mutates state.`,
+    tool,
+    outcome: "unknown",
+  };
+}
+
+/**
  * Classifies an arbitrary thrown value into the adapter vocabulary.
  *
  * The thrown value is inspected only. Its message is deliberately discarded:

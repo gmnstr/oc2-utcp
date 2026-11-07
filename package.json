@@ -1,6 +1,6 @@
 {
   "name": "oc2-utcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "OpenCode V2 plugin exposing UTCP manuals as a single Code Mode tool namespace",
