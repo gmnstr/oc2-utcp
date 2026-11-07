@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { UtcpAdapter, MAX_INFLIGHT_GLOBAL, MAX_INFLIGHT_PER_MANUAL } from "../src/plugin.js";
+import { UtcpAdapter, MAX_INFLIGHT_GLOBAL, MAX_INFLIGHT_PER_MANUAL, MAX_CATALOG_TOOLS } from "../src/plugin.js";
+import { loadConfig, MAX_CONFIGURED_MANUALS } from "../src/config.js";
 import { MAX_ARG_BYTES, refuseArgumentShape } from "../src/schema.js";
 import { boundedJsonStringify, MAX_MODEL_OUTPUT_BYTES } from "../src/output.js";
 import { makeFakeHost, type FakeHost } from "./helpers/host.js";
@@ -122,4 +123,35 @@ describe("hard unsettled-call admission on every transport", () => {
     while (third.releaseOne()) {}
     await Promise.all([...a, ...b, nowAllowed]);
   }, 30_000);
+});
+
+describe("registration and execution outcome boundaries", () => {
+  test("oversized manual configuration is refused before registration", () => {
+    const manuals = Array.from({ length: MAX_CONFIGURED_MANUALS + 1 }, (_, n) => ({
+      name: `manual_${n}`, call_template_type: "http", url: "http://127.0.0.1:9/manual",
+    }));
+    const configured = loadConfig({ manuals }, "/tmp/test-root");
+    expect(configured.ok).toBe(false);
+    if (configured.ok === false) expect(configured.error.code).toBe("CONFIG_INVALID");
+  });
+
+  test("an oversized catalog is refused before schema compilation", async () => {
+    const server = fixture(Array.from({ length: MAX_CATALOG_TOOLS + 1 }, (_, i) => ({ name: `t${i}` })));
+    const host = makeFakeHost({ manuals: [httpManual("demo", server)] });
+    const adapter = new UtcpAdapter(host.ctx, { log: () => undefined });
+    await adapter.start();
+    cleanup.push(() => adapter.dispose());
+    expect(adapter.status().state).toBe("closed");
+    expect(adapter.status().error?.code).toBe("CONFIG_INVALID");
+    expect(host.tools.size).toBe(0);
+  }, 30_000);
+
+  test("a transport error after dispatch reports unknown outcome without retry", async () => {
+    const server = fixture([{ name: "commit_then_error", status: 500 }]);
+    const host = await start([httpManual("demo", server)]);
+    const result = await host.runJson("call", { name: "demo.commit_then_error", arguments: {} });
+    expect(result).toMatchObject({ ok: false, error: { code: "TRANSPORT_ERROR", outcome: "unknown" } });
+    expect(result.error.message).toContain("check remote state");
+    expect(server.hits("commit_then_error")).toBe(1);
+  });
 });

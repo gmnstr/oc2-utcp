@@ -21,6 +21,8 @@ export const WAIT_MS_MIN = 1_000;
 export const WAIT_MS_MAX = 600_000;
 /** Longest manual `name` allowed on a manual with `waitMs`; the registry truncates names at this length. */
 export const WAIT_NAME_MAX_LENGTH = 120;
+/** Maximum configured manuals before any SDK initialization or I/O. */
+export const MAX_CONFIGURED_MANUALS = 32;
 
 export interface AdapterConfig {
   /** Root used to resolve relative manual paths; never the ambient cwd. */
@@ -89,6 +91,9 @@ export function loadConfig(rawOptions: unknown, locationDirectory: string | unde
   const manualsRaw = rawOptions.manuals;
   if (!Array.isArray(manualsRaw)) {
     return configInvalid("`manuals` must be an array of UTCP manual call templates.");
+  }
+  if (manualsRaw.length > MAX_CONFIGURED_MANUALS) {
+    return configInvalid(`Too many configured manuals; the maximum is ${MAX_CONFIGURED_MANUALS}.`);
   }
   const manuals: CallTemplate[] = [];
   const seenNames = new Set<string>();

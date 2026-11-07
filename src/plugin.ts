@@ -46,6 +46,7 @@ import {
   type ErrorBody,
   type FailureResult,
   type ManualStatus,
+  UtcpAdapterError,
 } from "./errors.js";
 
 const NAMESPACE = "utcp";
@@ -69,6 +70,8 @@ const MAX_SEARCH_LIMIT = 50;
 /** Hard admission limits for unsettled SDK calls, regardless of waitMs or transport. */
 export const MAX_INFLIGHT_GLOBAL = 64;
 export const MAX_INFLIGHT_PER_MANUAL = 32;
+/** Prevent unbounded catalog schema compilation after registration. */
+export const MAX_CATALOG_TOOLS = 512;
 
 /**
  * Upper bound on each dispose wait: in-flight calls, the registration disposal,
@@ -448,6 +451,12 @@ export class UtcpAdapter {
     const byName = new Map(this.manuals.map((status) => [status.name, status]));
     const byTemplate = new Map(candidates.map((candidate) => [candidate.name, candidate]));
     const tools = await client.getTools();
+    if (tools.length > MAX_CATALOG_TOOLS) {
+      throw new UtcpAdapterError(
+        "CONFIG_INVALID",
+        `UTCP discovered more than ${MAX_CATALOG_TOOLS} tools; the catalog was refused before schema compilation.`,
+      );
+    }
 
     for (const tool of tools) {
       const manual = manualOf(tool);
@@ -1114,8 +1123,19 @@ export class UtcpAdapter {
       pending.catch(() => {});
       const durationMs = Date.now() - startedAt;
       const body = classifyThrown(error, name);
+      // After a transport attempt, socket errors and remote rejections do not
+      // prove that a mutating operation was not committed before the failure.
+      // Keep configuration failures that are known to be pre-dispatch distinct.
+      const uncertain = body.code !== "CONFIGURATION_ERROR" && body.code !== "CONFIG_INVALID";
+      const reported = uncertain
+        ? {
+            ...body,
+            outcome: "unknown" as const,
+            message: `${body.message} The operation may have completed; check remote state before retrying a mutating call.`,
+          }
+        : body;
       this.logCall(entry, context, invocationID, durationMs, false, body.code);
-      return failure(body);
+      return failure(reported);
     } finally {
       clearTimeout(waitTimer);
       signal?.removeEventListener("abort", onAbort);
