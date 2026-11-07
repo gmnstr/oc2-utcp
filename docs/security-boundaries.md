@@ -10,10 +10,12 @@ host security risks.
   manual, including manuals without `waitMs`. Capacity is reserved before
   dispatch and released only when the SDK promise settles. A timeout, caller
   abort, or expiry of a `waitMs` hold does not free this hard capacity.
-- **Registration:** at most 32 configured manuals before any SDK setup, and at most 512 discovered tools before schema compilation. The latter does not constrain bytes fetched or parsed by the SDK.\n- **Pre-clone arguments:** reject arguments larger than 1 MiB of UTF-8 data
+- **Registration:** at most 32 configured manuals before any SDK setup, and at most 512 discovered tools before schema compilation. The latter does not constrain bytes fetched or parsed by the SDK.
+- **Pre-clone arguments:** reject arguments larger than 1 MiB of UTF-8 data
   (including object keys), in addition to the existing node and depth limits.
   The limit runs before `structuredClone` and schema worker messaging.
-- **Execution errors:** once dispatch has possibly occurred, transport failures are reported with an unknown outcome; a remote side effect cannot be excluded solely from an HTTP or MCP error.\n- **Model-facing serialization:** reject rather than silently truncate a JSON
+- **Execution errors:** once dispatch has possibly occurred, transport failures are reported with an unknown outcome; a remote side effect cannot be excluded solely from an HTTP or MCP error.
+- **Model-facing serialization:** reject rather than silently truncate a JSON
   tool response or metadata projection above 256 KiB. Results that exceed the
   presentation limit return `RESULT_TOO_LARGE`; after a call is dispatched,
   the outcome is marked `unknown` to discourage unsafe retries.
