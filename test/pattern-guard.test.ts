@@ -319,7 +319,9 @@ describe("hostile patterns through the adapter", () => {
     const result = await host.runJson("call", { name: "demo.hostile", arguments: args });
     expect(result.ok).toBe(false);
     expect(result.error.code).toBe("VALIDATION_FAILED");
-    expect(result.error.message).toBe(TIME_LIMIT_MESSAGE);
+    // Either outcome is a fail-closed refusal: the deadline fired, or the regex engine finished
+    // one of the six fields first and reported the pattern miss (timing differs by host).
+    expect(result.error.message === TIME_LIMIT_MESSAGE || /violates 'pattern' in the tool's schema\.$/.test(result.error.message)).toBe(true);
     expect(server.hits("hostile")).toBe(0);
     // Validation runs before assertPermission, so the permission hook never sees the call.
     expect(host.asserts).toHaveLength(0);
